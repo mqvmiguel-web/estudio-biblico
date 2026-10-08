@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+URL="http://127.0.0.1:8765"
+PROFILE="$HOME/.local/share/mi-estudio-biblico/chromium-profile"
+
+# La ventana debe abrirse en la pantalla PRINCIPAL, no en la secundaria.
+# --window-position usa coordenadas globales del escritorio virtual, asi que
+# (0,0) siempre cae en el monitor que este mas a la izquierda (el externo).
+# Se calcula el origen de la pantalla de prioridad 1 para no depender de cual
+# monitor este conectado.
+pantalla_principal() {
+    kscreen-doctor -o 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g' \
+        | awk '
+            /^Output:/ { if (pri == "1" && gx != "") { print gx, gy; exit }; pri=""; gx=""; gy="" }
+            /^[[:space:]]*priority/  { pri = $2 }
+            /^[[:space:]]*Geometry:/  { gsub(/[ \t]+/, " "); split($2, a, ","); gx = a[1]; gy = a[2] }
+            END { if (pri == "1" && gx != "") print gx, gy }
+        '
+}
+read -r ORIGEN_X ORIGEN_Y <<<"$(pantalla_principal)" || true
+ORIGEN_X="${ORIGEN_X:-0}"
+ORIGEN_Y="${ORIGEN_Y:-0}"
+# Margen para que la ventana no quede pegada al borde de la pantalla
+POSICION="$((ORIGEN_X + 60)),$((ORIGEN_Y + 60))"
+
+systemctl --user start mi-estudio-biblico.service
+for intento in {1..30}; do
+    curl -fsS "$URL/api/books" >/dev/null 2>&1 && break
+    sleep 0.25
+done
+if command -v chromium >/dev/null 2>&1; then
+    exec chromium --app="$URL" --class=mi-estudio-biblico --ozone-platform=wayland --start-maximized --window-position="$POSICION" --window-size=1840,1000 --user-data-dir="$PROFILE"
+elif command -v google-chrome-stable >/dev/null 2>&1; then
+    exec google-chrome-stable --app="$URL" --class=mi-estudio-biblico --ozone-platform=wayland --start-maximized --window-position="$POSICION" --window-size=1840,1000 --user-data-dir="$HOME/.local/share/mi-estudio-biblico/chrome-profile"
+else
+    exec firefox --new-window "$URL"
+fi

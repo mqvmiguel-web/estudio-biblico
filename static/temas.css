@@ -1,0 +1,177 @@
+/* ===========================================================
+   TEMAS_V1 — sistema de temas con selector en ajustes
+   Temas: verde (actual), azul oceano, violeta crepúsculo, ámbar cálido,
+          monocromo, sepia lectura, oscuro noche, alto contraste
+   Se guarda en localStorage y aplica a :root
+=========================================================== */
+:root{
+  /* tema actual - variables que cambian */
+  --tema-acento:#176b49;
+  --tema-acento2:#e2f2ea;
+  --tema-fondo:#eef2f0;
+  --tema-panel:#fff;
+  --tema-soft:#f5f8f6;
+  --tema-texto:#18231d;
+  --tema-muted:#6b7871;
+  --tema-line:#dce4df;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(0,0,0,.15);
+}
+
+/* ========== TEMAS DISPONIBLES ========== */
+
+/* 🌿 Verde Bosque (actual) */
+[data-tema="verde"]{
+  --tema-acento:#176b49;
+  --tema-acento2:#e2f2ea;
+  --tema-fondo:#eef2f0;
+  --tema-panel:#fff;
+  --tema-soft:#f5f8f6;
+  --tema-texto:#18231d;
+  --tema-muted:#6b7871;
+  --tema-line:#dce4df;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(23,107,73,.25);
+}
+
+/* 🌊 Azul Océano */
+[data-tema="azul"]{
+  --tema-acento:#0d6efd;
+  --tema-acento2:#d6e9ff;
+  --tema-fondo:#f0f5ff;
+  --tema-panel:#fff;
+  --tema-soft:#e8f0fe;
+  --tema-texto:#0a1d3a;
+  --tema-muted:#5a7ab8;
+  --tema-line:#c9dfff;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(13,110,253,.25);
+}
+
+/* 🌅 Violeta Crepúsculo */
+[data-tema="violeta"]{
+  --tema-acento:#7c3aed;
+  --tema-acento2:#f0e7ff;
+  --tema-fondo:#faf5ff;
+  --tema-panel:#fff;
+  --tema-soft:#f3ebff;
+  --tema-texto:#2e1065;
+  --tema-muted:#8b70c8;
+  --tema-line:#e2d5ff;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(124,58,237,.25);
+}
+
+/* 🍂 Ámbar Cálido */
+[data-tema="ambar"]{
+  --tema-acento:#d97706;
+  --tema-acento2:#fff8e1;
+  --tema-fondo:#fffef7;
+  --tema-panel:#fffdf5;
+  --tema-soft:#fff8e1;
+  --tema-texto:#451a03;
+  --tema-muted:#b8860b;
+  --tema-line:#ffe08a;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(217,119,6,.25);
+}
+
+/* ⚫ Monocromo Elegante */
+[data-tema="monocromo"]{
+  --tema-acento:#1a1a2e;
+  --tema-acento2:#e8e8ee;
+  --tema-fondo:#f5f5f7;
+  --tema-panel:#fff;
+  --tema-soft:#eef0f2;
+  --tema-texto:#111;
+  --tema-muted:#6b6b6b;
+  --tema-line:#d1d1d1;
+  --tema-texto-inv:#fff;
+  --tema-sombra:rgba(0,0,0,.15);
+}
+
+/* 📜 Sepia Lectura (modo papel) */
+[data-tema="sepia"]{
+  --tema-acento:#8b6914;
+  --tema-acento2:#fdf6e3;
+  --tema-fondo:#fdf6e3;
+  --tema-panel:#fefae0;
+  --tema-soft:#f5f0d8;
+  --tema-texto:#3c2f0f;
+  --tema-muted:#a68b4c;
+  --tema-line:#e8dcc8;
+  --tema-texto-inv:#3c2f0f;
+  --tema-sombra:rgba(139,105,20,.2);
+}
+
+/* 🌙 Noche Oscura */
+[data-tema="oscuro"]{
+  --tema-acento:#22c55e;
+  --tema-acento2:#14532d;
+  --tema-fondo:#0f1712;
+  --tema-panel:#1a2416;
+  --tema-soft:#1f2d1b;
+  --tema-texto:#e8f5e9;
+  --tema-muted:#7fb07a;
+  --tema-line:#2d4a26;
+  --tema-texto-inv:#0f1712;
+  --tema-sombra:rgba(0,0,0,.4);
+}
+
+/* 🌈 Alto Contraste (accesibilidad) */
+[data-tema="contraste"]{
+  --tema-acento:#00ff00;
+  --tema-acento2:#003300;
+  --tema-fondo:#000;
+  --tema-panel:#111;
+  --tema-soft:#222;
+  --tema-texto:#fff;
+  --tema-muted:#0f0;
+  --tema-line:#0f0;
+  --tema-texto-inv:#000;
+  --tema-sombra:rgba(0,255,0,.4);
+}
+
+/* ========== MODAL TEMA ========== */
+.tema-modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;
+  display:grid;place-items:center;padding:16px;
+  opacity:0;transform:scale(0.95);transition:opacity .2s,transform .2s;
+}
+.tema-modal-overlay.abierto{
+  opacity:1 !important;transform:scale(1) !important;
+}
+.tema-modal{
+  background:var(--panel);border-radius:16px;padding:20px;
+  width:100%;max-width:420px;box-shadow:0 20px 60px #0004;
+}
+.tema-cerrar{
+  position:absolute;top:8px;right:10px;border:0;background:transparent;
+  font-size:22px;color:var(--muted);cursor:pointer;padding:4px;line-height:1;
+}
+.tema-cerrar:hover{color:var(--text)}
+.tema-modal h2{margin:0 0 4px;font-size:20px}
+.tema-sub{margin:0 0 16px;color:var(--muted);font-size:13px}
+.tema-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;max-height:50vh;overflow:auto}
+.tema-opcion{
+  border:2px solid var(--line);background:var(--panel);border-radius:12px;
+  padding:14px 12px;cursor:pointer;text-align:left;transition:.15s;
+}
+.tema-opcion:hover{border-color:var(--green);background:var(--green2)}
+.tema-opcion.activa{
+  border-color:var(--green);background:var(--green2);box-shadow:0 0 0 2px var(--green2)
+}
+.tema-icono{font-size:20px;display:block;margin-bottom:6px}
+.tema-opcion strong{display:block;font-size:14px}
+.tema-opcion small{color:var(--muted);font-size:12px}
+.tema-nota{margin:12px 0 0;font-size:12px;color:var(--muted);text-align:center}
+@media(max-width:520px){
+  .tema-grid{grid-template-columns:1fr}
+}
+
+/* ===== utilidad: animación suave al cambiar tema ===== */
+*,
+*::before,
+*::after{
+  transition:background-color .3s ease,color .3s ease,border-color .3s ease,box-shadow .3s ease;
+}

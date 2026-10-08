@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "creado": "2026-10-01T23:14:27",
+  "archivos": [
+    {
+      "ruta": "data/estudio.db",
+      "tamano": 311296,
+      "sha256": "6b2e82346b559cd2446db9f124d67d0b20fbcb3a4e18e8c806b42ec07d5bdb6b"
+    },
+    {
+      "ruta": "data/documentos/2d674f457e9a.json",
+      "tamano": 4860,
+      "sha256": "16f8b0f7484e79c86fe1b8487dbe53463890d2589e065ca9a8312d0bf9a9851e"
+    },
+    {
+      "ruta": "data/documentos/4f786659560f.json",
+      "tamano": 3379,
+      "sha256": "e098d19ce83dd0af9dfe81a6d9a18bfe5ebad6b3235d47986ca751fba9ef7ec3"
+    },
+    {
+      "ruta": "data/documentos/dc8c2e9da7d3.json",
+      "tamano": 24406,
+      "sha256": "9e99dd3b2d368c2cf0ac45a9badd4482b821a2c7f8dc0808882fad822a5a6b35"
+    }
+  ]
+}

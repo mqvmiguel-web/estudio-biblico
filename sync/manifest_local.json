@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "creado": "2026-09-10T00:57:28",
+  "archivos": [
+    {
+      "ruta": "data/estudio.db",
+      "tamano": 86016,
+      "sha256": "f4e32aeb24596fd58ef0cb699fce38d9939e0363cd27c7401f578ae31c80775f"
+    },
+    {
+      "ruta": "data/documentos/dc8c2e9da7d3.json",
+      "tamano": 6864,
+      "sha256": "c5bce8dfdcf28e64dfd3121553e71371c36e1380e33b55497b5aa08073fb8e37"
+    }
+  ]
+}

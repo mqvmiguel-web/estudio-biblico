@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+URL="http://127.0.0.1:8765"
+PROFILE="$HOME/.local/share/mi-estudio-biblico/chromium-profile"
+systemctl --user start mi-estudio-biblico.service
+for intento in {1..30}; do
+    curl -fsS "$URL/api/books" >/dev/null 2>&1 && break
+    sleep 0.25
+done
+if command -v chromium >/dev/null 2>&1; then
+    exec chromium --ozone-platform=x11 --app="$URL" --class=mi-estudio-biblico --start-maximized --window-position=40,40 --window-size=1840,1000 --user-data-dir="$PROFILE"
+elif command -v google-chrome-stable >/dev/null 2>&1; then
+    exec google-chrome-stable --ozone-platform=x11 --app="$URL" --class=mi-estudio-biblico --start-maximized --window-position=40,40 --window-size=1840,1000 --user-data-dir="$HOME/.local/share/mi-estudio-biblico/chrome-profile"
+else
+    exec firefox --new-window "$URL"
+fi

@@ -1,0 +1,2173 @@
+#!/usr/bin/env python3
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+import ast
+import json
+import re
+import sqlite3
+import smtplib
+import ssl
+import threading
+import time
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+import subprocess
+import uuid
+from collections import Counter
+from email.parser import BytesParser
+from email.policy import default as email_policy
+# OBS_CONTROL_V1: control de transmision/escenas para el predicador.
+# El password de OBS se queda en este proceso; el navegador solo ve el estado.
+import obs_control
+
+ROOT = Path(__file__).resolve().parent
+STATIC = ROOT / "static"
+BIBLE_RVR = ROOT / "biblia" / "rvr1960"
+BIBLE_LBLA = ROOT / "biblia" / "lbla"
+BIBLE_VERSIONS = {
+    "rvr1960": {"nombre":"Reina-Valera 1960", "abreviatura":"RVR1960"},
+    "lbla": {"nombre":"La Biblia de las Américas", "abreviatura":"LBLA"}
+}
+DB = ROOT / "data" / "estudio.db"
+EMAIL_CONFIG = ROOT / "data" / "correo_gmail.json"
+DOCUMENTS = ROOT / "data" / "documentos"
+RECORDINGS = ROOT / "data" / "grabaciones"
+ARCHIVE_COPY_MARKER = "copia con notas"  # solo estas se pueden borrar desde el archivo
+PORT = 8765
+DOCUMENTS.mkdir(parents=True, exist_ok=True)
+RECORDINGS.mkdir(parents=True, exist_ok=True)
+
+BOOKS = [
+ ("genesis","Génesis"),("exodo","Éxodo"),("levitico","Levítico"),("numeros","Números"),("deuteronomio","Deuteronomio"),
+ ("josue","Josué"),("jueces","Jueces"),("rut","Rut"),("1_samuel","1 Samuel"),("2_samuel","2 Samuel"),
+ ("1_reyes","1 Reyes"),("2_reyes","2 Reyes"),("1_cronicas","1 Crónicas"),("2_cronicas","2 Crónicas"),
+ ("esdras","Esdras"),("nehemias","Nehemías"),("ester","Ester"),("job","Job"),("salmos","Salmos"),
+ ("proverbios","Proverbios"),("eclesiastes","Eclesiastés"),("cantares","Cantares"),("isaias","Isaías"),
+ ("jeremias","Jeremías"),("lamentaciones","Lamentaciones"),("ezequiel","Ezequiel"),("daniel","Daniel"),
+ ("oseas","Oseas"),("joel","Joel"),("amos","Amós"),("abdias","Abdías"),("jonas","Jonás"),("miqueas","Miqueas"),
+ ("nahum","Nahúm"),("habacuc","Habacuc"),("sofonias","Sofonías"),("hageo","Hageo"),("zacarias","Zacarías"),
+ ("malaquias","Malaquías"),("mateo","Mateo"),("marcos","Marcos"),("lucas","Lucas"),("juan","Juan"),
+ ("hechos","Hechos"),("romanos","Romanos"),("1_corintios","1 Corintios"),("2_corintios","2 Corintios"),
+ ("galatas","Gálatas"),("efesios","Efesios"),("filipenses","Filipenses"),("colosenses","Colosenses"),
+ ("1_tesalonicenses","1 Tesalonicenses"),("2_tesalonicenses","2 Tesalonicenses"),("1_timoteo","1 Timoteo"),
+ ("2_timoteo","2 Timoteo"),("tito","Tito"),("filemon","Filemón"),("hebreos","Hebreos"),("santiago","Santiago"),
+ ("1_pedro","1 Pedro"),("2_pedro","2 Pedro"),("1_juan","1 Juan"),("2_juan","2 Juan"),("3_juan","3 Juan"),
+ ("judas","Judas"),("apocalipsis","Apocalipsis")]
+BOOK_NAMES = dict(BOOKS)
+_cache = {}
+
+def db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS mensajes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titulo TEXT NOT NULL DEFAULT 'Mensaje sin título',
+            texto_base TEXT NOT NULL DEFAULT '',
+            tipo TEXT NOT NULL DEFAULT 'Borrador',
+            contenido TEXT NOT NULL DEFAULT '',
+            actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+
+# MODO_PREDICACION_V1
+def init_presentations_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS presentaciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mensaje_id INTEGER,
+            titulo TEXT NOT NULL DEFAULT 'Nueva predicación',
+            texto_base TEXT NOT NULL DEFAULT '',
+            idea_central TEXT NOT NULL DEFAULT '',
+            introduccion TEXT NOT NULL DEFAULT '',
+            puntos TEXT NOT NULL DEFAULT '[]',
+            versiculos TEXT NOT NULL DEFAULT '',
+            aplicacion TEXT NOT NULL DEFAULT '',
+            titulo_aplicacion TEXT NOT NULL DEFAULT '',
+            conclusion TEXT NOT NULL DEFAULT '',
+            notas_privadas TEXT NOT NULL DEFAULT '',
+            actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        cols = [row[1] for row in con.execute("PRAGMA table_info(presentaciones)").fetchall()]
+        if "titulo_aplicacion" not in cols:
+            con.execute("ALTER TABLE presentaciones ADD COLUMN titulo_aplicacion TEXT NOT NULL DEFAULT ''")
+
+def presentation_dict(row):
+    value = dict(row)
+    try: value["puntos"] = json.loads(value.get("puntos") or "[]")
+    except Exception: value["puntos"] = []
+    return value
+
+def presentation_values(data):
+    points = data.get("puntos", [])
+    if not isinstance(points, list): points = []
+    points = [str(point).strip()[:10000] for point in points if str(point).strip()][:30]
+    return (
+        str(data.get("titulo") or "Nueva predicación").strip()[:300],
+        str(data.get("texto_base", ""))[:1000],
+        str(data.get("idea_central", ""))[:5000],
+        str(data.get("introduccion", ""))[:20000],
+        json.dumps(points, ensure_ascii=False),
+        str(data.get("versiculos", ""))[:10000],
+        str(data.get("aplicacion", ""))[:20000],
+        str(data.get("titulo_aplicacion", ""))[:300],
+        str(data.get("conclusion", ""))[:20000],
+        str(data.get("notas_privadas", ""))[:30000]
+    )
+
+
+# RESALTADOR_BIBLICO_V1
+HIGHLIGHT_COLORS = {"yellow", "green", "blue", "pink", "purple"}
+
+def init_highlights_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS resaltados_biblicos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL,
+            libro TEXT NOT NULL,
+            capitulo INTEGER NOT NULL,
+            versiculo INTEGER NOT NULL,
+            inicio INTEGER NOT NULL,
+            fin INTEGER NOT NULL,
+            texto TEXT NOT NULL,
+            color TEXT NOT NULL DEFAULT 'yellow',
+            nota TEXT NOT NULL DEFAULT '',
+            creado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        con.execute("""CREATE INDEX IF NOT EXISTS idx_resaltados_pasaje
+            ON resaltados_biblicos(version,libro,capitulo,versiculo)""")
+
+def validate_highlight(data):
+    version = str(data.get("version", ""))
+    book = str(data.get("libro", ""))
+    chapter = int(data.get("capitulo", 0))
+    verse = int(data.get("versiculo", 0))
+    start = int(data.get("inicio", -1))
+    end = int(data.get("fin", -1))
+    color = str(data.get("color", "yellow"))
+    if version not in BIBLE_VERSIONS: raise ValueError("Versión bíblica desconocida")
+    if book not in BOOK_NAMES: raise ValueError("Libro desconocido")
+    chapters = load_book(book, version)
+    if chapter < 1 or chapter > len(chapters): raise ValueError("Capítulo inválido")
+    verses = chapters[chapter - 1]
+    if verse < 1 or verse > len(verses): raise ValueError("Versículo inválido")
+    full_text = str(verses[verse - 1])
+    if start < 0 or end <= start or end > len(full_text): raise ValueError("Selección inválida")
+    if color not in HIGHLIGHT_COLORS: raise ValueError("Color inválido")
+    selected = full_text[start:end]
+    if not selected.strip(): raise ValueError("Selecciona un texto")
+    return version, book, chapter, verse, start, end, selected, color
+
+def init_reminders_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS recordatorios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titulo TEXT NOT NULL,
+            contenido TEXT NOT NULL DEFAULT '',
+            hora TEXT NOT NULL,
+            dias TEXT NOT NULL DEFAULT 'todos',
+            activo INTEGER NOT NULL DEFAULT 1,
+            ultimo_aviso TEXT NOT NULL DEFAULT '',
+            creado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+def init_email_reminders_db():
+    with db() as con:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(recordatorios)")}
+        for name, definition in (
+            ("enviar_correo", "INTEGER NOT NULL DEFAULT 0"),
+            ("correo_destino", "TEXT NOT NULL DEFAULT ''"),
+            ("ultimo_envio_correo", "TEXT NOT NULL DEFAULT ''"),
+            ("estado_correo", "TEXT NOT NULL DEFAULT ''")
+        ):
+            if name not in columns:
+                con.execute(f"ALTER TABLE recordatorios ADD COLUMN {name} {definition}")
+
+def load_email_config(include_password=False):
+    if not EMAIL_CONFIG.is_file(): return {}
+    try: value = json.loads(EMAIL_CONFIG.read_text(encoding="utf-8"))
+    except Exception: return {}
+    if not include_password: value.pop("app_password", None)
+    return value
+
+def save_email_config(data):
+    sender = str(data.get("sender", "")).strip()
+    recipient = str(data.get("recipient", "")).strip()
+    password = str(data.get("app_password", "")).replace(" ", "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", sender): raise ValueError("Correo Gmail no válido")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient): raise ValueError("Correo destinatario no válido")
+    previous = load_email_config(True)
+    if not password: password = previous.get("app_password", "")
+    if not password: raise ValueError("Escribe la contraseña de aplicación de Gmail")
+    value = {"provider":"gmail","sender":sender,"recipient":recipient,"app_password":password}
+    EMAIL_CONFIG.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    EMAIL_CONFIG.chmod(0o600)
+    return {"provider":"gmail","sender":sender,"recipient":recipient,"configured":True}
+
+def send_gmail(subject, body, recipient=""):
+    config = load_email_config(True)
+    sender = config.get("sender", ""); password = config.get("app_password", "")
+    destination = str(recipient or config.get("recipient", "")).strip()
+    if not sender or not password or not destination: raise ValueError("Configura primero tu cuenta Gmail")
+    message = EmailMessage()
+    message["From"] = sender; message["To"] = destination; message["Subject"] = subject
+    message.set_content(body)
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=25) as smtp:
+        smtp.login(sender, password)
+        smtp.send_message(message)
+    return destination
+
+def email_rule_applies(rule, now):
+    weekday = now.weekday()
+    if rule == "laborales": return weekday < 5
+    if rule == "fin_semana": return weekday >= 5
+    return True
+
+def email_reminder_worker():
+    while True:
+        try:
+            now = datetime.now(); current_time = now.strftime("%H:%M"); today = now.strftime("%Y-%m-%d")
+            with db() as con:
+                rows = con.execute("SELECT * FROM recordatorios WHERE activo=1 AND enviar_correo=1 AND hora=?", (current_time,)).fetchall()
+            for row in rows:
+                reminder = dict(row)
+                if reminder.get("ultimo_envio_correo") == today or not email_rule_applies(reminder.get("dias"), now): continue
+                try:
+                    destination = send_gmail(
+                        "Recordatorio bíblico: " + reminder.get("titulo", ""),
+                        reminder_email_body(reminder),
+                        reminder.get("correo_destino", "")
+                    )
+                    status = "Enviado a " + destination
+                    with db() as con:
+                        con.execute("UPDATE recordatorios SET ultimo_envio_correo=?,estado_correo=? WHERE id=?", (today,status,reminder["id"]))
+                        if reminder.get("dias") == "una_vez": con.execute("UPDATE recordatorios SET activo=0 WHERE id=?", (reminder["id"],))
+                except Exception as exc:
+                    with db() as con: con.execute("UPDATE recordatorios SET estado_correo=? WHERE id=?", ("Error: "+str(exc)[:300],reminder["id"]))
+        except Exception as exc:
+            print("Error en recordatorios por correo:", exc)
+        time.sleep(30)
+
+def start_email_reminder_worker():
+    threading.Thread(target=email_reminder_worker, name="recordatorios-correo", daemon=True).start()
+
+
+def init_dashboard_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS uso_programa (
+            fecha TEXT PRIMARY KEY,
+            aperturas INTEGER NOT NULL DEFAULT 1,
+            primera_apertura TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            ultima_apertura TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS lecturas_consultadas (
+            fecha TEXT NOT NULL,
+            version TEXT NOT NULL,
+            libro TEXT NOT NULL,
+            capitulo INTEGER NOT NULL,
+            consultado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(fecha,version,libro,capitulo)
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS estados_animo (
+            fecha TEXT PRIMARY KEY,
+            estado TEXT NOT NULL,
+            nota TEXT NOT NULL DEFAULT '',
+            actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+def local_today():
+    return datetime.now().strftime("%Y-%m-%d")
+
+def valid_day(value):
+    try: return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception: return None
+
+def usage_streak(dates):
+    parsed = sorted({valid_day(x) for x in dates if valid_day(x)}, reverse=True)
+    if not parsed: return 0
+    today = datetime.now().date()
+    if (today - parsed[0]).days > 1: return 0
+    streak = 1
+    for previous,current in zip(parsed, parsed[1:]):
+        if (previous-current).days == 1: streak += 1
+        else: break
+    return streak
+
+def dashboard_data():
+    today = local_today()
+    with db() as con:
+        usage_dates = [row[0] for row in con.execute("SELECT fecha FROM uso_programa ORDER BY fecha DESC")]
+        usage_days = con.execute("SELECT COUNT(*) FROM uso_programa").fetchone()[0]
+        openings = con.execute("SELECT COALESCE(SUM(aperturas),0) FROM uso_programa").fetchone()[0]
+        readings_total = con.execute("SELECT COUNT(*) FROM lecturas_consultadas").fetchone()[0]
+        readings_today = con.execute("SELECT COUNT(*) FROM lecturas_consultadas WHERE fecha=?",(today,)).fetchone()[0]
+        messages = con.execute("SELECT COUNT(*) FROM mensajes").fetchone()[0]
+        reminders = con.execute("SELECT COUNT(*) FROM recordatorios WHERE activo=1").fetchone()[0]
+        moods = [dict(row) for row in con.execute("SELECT fecha,estado,nota FROM estados_animo ORDER BY fecha DESC LIMIT 7")]
+        mood_today = con.execute("SELECT fecha,estado,nota FROM estados_animo WHERE fecha=?",(today,)).fetchone()
+    documents = sum(1 for path in DOCUMENTS.glob("*.json")) if 'DOCUMENTS' in globals() else 0
+    recordings = sum(1 for path in RECORDINGS.glob("*.json")) if 'RECORDINGS' in globals() else 0
+    return {"fecha":today,"dias_uso":usage_days,"aperturas":openings,"racha":usage_streak(usage_dates),
+            "lecturas_total":readings_total,"lecturas_hoy":readings_today,"mensajes":messages,
+            "recordatorios":reminders,"documentos":documents,"grabaciones":recordings,
+            "estado_hoy":dict(mood_today) if mood_today else None,"historial_animo":moods}
+
+
+# CONCENTRACION_REPORTES_V1
+AUTOMATION_DEFAULTS = {
+    "late_enabled": True, "late_hour": "20:30", "late_days": 1,
+    "daily_enabled": True, "daily_hour": "08:00",
+    "weekly_enabled": False, "weekly_day": 6, "weekly_hour": "20:30",
+    "monthly_enabled": True, "monthly_day": 1, "monthly_hour": "09:00",
+    "recipient": ""
+}
+REPORT_VERSES = [
+    ("Salmos 119:105", "salmos", 119, 105),
+    ("Josué 1:8", "josue", 1, 8),
+    ("2 Timoteo 3:16", "2_timoteo", 3, 16),
+    ("Salmos 1:2", "salmos", 1, 2),
+    ("Proverbios 3:5", "proverbios", 3, 5),
+    ("Jeremías 33:3", "jeremias", 33, 3),
+    ("Filipenses 4:13", "filipenses", 4, 13)
+]
+
+def init_automation_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS estados_plan (
+            modo TEXT PRIMARY KEY, inicio TEXT NOT NULL DEFAULT '', dia_actual INTEGER NOT NULL DEFAULT 1,
+            completadas INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, dias_atraso INTEGER NOT NULL DEFAULT 0,
+            hoy_completadas INTEGER NOT NULL DEFAULT 0, hoy_total INTEGER NOT NULL DEFAULT 0,
+            ultimo_dia_completado INTEGER NOT NULL DEFAULT 0, reflexiones INTEGER NOT NULL DEFAULT 0,
+            datos TEXT NOT NULL DEFAULT '{}', actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS sesiones_concentracion (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, tipo TEXT NOT NULL, proposito TEXT NOT NULL DEFAULT '',
+            notas TEXT NOT NULL DEFAULT '', minutos_planeados INTEGER NOT NULL DEFAULT 25,
+            segundos_realizados INTEGER NOT NULL DEFAULT 0, completada INTEGER NOT NULL DEFAULT 0,
+            creado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS configuracion_automatizaciones (
+            id INTEGER PRIMARY KEY CHECK(id=1), datos TEXT NOT NULL DEFAULT '{}',
+            actualizado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS envios_automaticos (
+            tipo TEXT NOT NULL, periodo TEXT NOT NULL, estado TEXT NOT NULL DEFAULT '',
+            enviado TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(tipo,periodo)
+        )""")
+
+def automation_settings():
+    with db() as con:
+        row = con.execute("SELECT datos FROM configuracion_automatizaciones WHERE id=1").fetchone()
+    value = dict(AUTOMATION_DEFAULTS)
+    if row:
+        try: value.update(json.loads(row[0] or "{}"))
+        except Exception: pass
+    return value
+
+def save_automation_settings(data):
+    value = dict(AUTOMATION_DEFAULTS)
+    current = automation_settings(); value.update(current)
+    for key in ("late_enabled", "weekly_enabled", "monthly_enabled", "daily_enabled"):
+        if key in data: value[key] = bool(data[key])
+    for key in ("late_hour", "weekly_hour", "monthly_hour", "daily_hour"):
+        if key in data:
+            candidate = str(data[key])
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", candidate): raise ValueError("Hora no válida")
+            value[key] = candidate
+    for key, low, high in (("late_days",1,30),("weekly_day",0,6),("monthly_day",1,28)):
+        if key in data:
+            number = int(data[key])
+            if number < low or number > high: raise ValueError("Valor de programación no válido")
+            value[key] = number
+    if "recipient" in data:
+        recipient = str(data.get("recipient", "")).strip()[:320]
+        if recipient and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient): raise ValueError("Correo destinatario no válido")
+        value["recipient"] = recipient
+    with db() as con:
+        con.execute("""INSERT INTO configuracion_automatizaciones(id,datos,actualizado) VALUES(1,?,datetime('now','localtime'))
+            ON CONFLICT(id) DO UPDATE SET datos=excluded.datos,actualizado=datetime('now','localtime')""",
+            (json.dumps(value, ensure_ascii=False),))
+    return value
+
+def report_verse(seed=None):
+    position = (seed if seed is not None else datetime.now().toordinal()) % len(REPORT_VERSES)
+    label, book, chapter, verse = REPORT_VERSES[position]
+    try: text = load_book(book, "rvr1960")[chapter-1][verse-1]
+    except Exception: text = "Lámpara es a mis pies tu palabra, y lumbrera a mi camino."
+    return {"referencia": label, "texto": text}
+
+def reminder_email_body(reminder):
+    verse = report_verse()
+    content = reminder.get("contenido") or "Tienes un recordatorio en Mi Estudio Bíblico."
+    return f"{content}\n\nTexto bíblico\n“{verse['texto']}”\n{verse['referencia']} · RVR1960\n\n— Mi Estudio Bíblico"
+
+def plan_rows():
+    with db() as con: rows = con.execute("SELECT * FROM estados_plan ORDER BY actualizado DESC").fetchall()
+    return [dict(row) for row in rows]
+
+def period_stats(start, end):
+    start_text, end_text = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    with db() as con:
+        days = con.execute("SELECT COUNT(*) FROM uso_programa WHERE fecha BETWEEN ? AND ?",(start_text,end_text)).fetchone()[0]
+        openings = con.execute("SELECT COALESCE(SUM(aperturas),0) FROM uso_programa WHERE fecha BETWEEN ? AND ?",(start_text,end_text)).fetchone()[0]
+        readings = con.execute("SELECT COUNT(*) FROM lecturas_consultadas WHERE fecha BETWEEN ? AND ?",(start_text,end_text)).fetchone()[0]
+        messages = con.execute("SELECT COUNT(*) FROM mensajes WHERE date(actualizado) BETWEEN ? AND ?",(start_text,end_text)).fetchone()[0]
+        focus = con.execute("SELECT COUNT(*),COALESCE(SUM(segundos_realizados),0) FROM sesiones_concentracion WHERE date(creado) BETWEEN ? AND ?",(start_text,end_text)).fetchone()
+        usage_dates = [r[0] for r in con.execute("SELECT fecha FROM uso_programa ORDER BY fecha DESC")]
+    plans = plan_rows(); reflections = max([p.get("reflexiones",0) for p in plans] or [0])
+    return {"dias_uso":days,"aperturas":openings,"lecturas":readings,"mensajes":messages,
+            "sesiones":focus[0],"minutos_concentracion":round(focus[1]/60),"racha":usage_streak(usage_dates),
+            "reflexiones":reflections,"planes":plans}
+
+MESES_CORTO = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"]
+
+
+def plan_period_stats(plan, start, end):
+    """Lecturas marcadas (con hora) dentro de un período y días en que se leyó."""
+    try:
+        datos = json.loads(plan.get("datos") or "{}")
+    except Exception:
+        datos = {}
+    stamps = datos.get("stamps") if isinstance(datos, dict) else None
+    if not isinstance(stamps, dict):
+        stamps = {}
+    desde, hasta = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    por_dia = {}
+    for marca in stamps.values():
+        fecha = str(marca or "")[:10]
+        if desde <= fecha <= hasta:
+            por_dia[fecha] = por_dia.get(fecha, 0) + 1
+    return {"lecturas": sum(por_dia.values()), "dias": sorted(por_dia)}
+
+
+def lista_dias(dias, limite=12):
+    if not dias:
+        return ""
+    etiquetas = []
+    for fecha in dias:
+        partes = str(fecha).split("-")
+        try:
+            etiquetas.append(f"{int(partes[2])} {MESES_CORTO[int(partes[1])-1]}")
+        except Exception:
+            etiquetas.append(str(fecha))
+    extra = len(etiquetas) - limite
+    if extra > 0:
+        etiquetas = etiquetas[:limite] + [f"…+{extra}"]
+    return ", ".join(etiquetas)
+
+
+def texto_delta(actual, previo):
+    delta = int(actual) - int(previo)
+    return f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "=")
+
+
+def build_report(kind="monthly", now=None):
+    now = now or datetime.now()
+    if kind == "weekly":
+        start = (now - timedelta(days=6)).date(); end = now.date()
+        prev_end = start - timedelta(days=1); prev_start = prev_end - timedelta(days=6)
+        title = "Resumen semanal"; comparacion = "la semana anterior"
+    else:
+        end = now.date().replace(day=1) - timedelta(days=1)
+        start = end.replace(day=1)
+        prev_end = start - timedelta(days=1); prev_start = prev_end.replace(day=1)
+        title = "Informe mensual"; comparacion = "el mes anterior"
+    stats = period_stats(start, end); prev = period_stats(prev_start, prev_end)
+    verse = report_verse(end.toordinal())
+    plan_text = []
+    for plan in stats["planes"]:
+        total = int(plan.get("total") or 0); done = int(plan.get("completadas") or 0)
+        pct = round(100*done/total) if total else 0
+        name = "Biblia cronológica" if plan.get("modo") == "cronologico" else "Nuevo y Antiguo Testamento"
+        act = plan_period_stats(plan, start, end); ant = plan_period_stats(plan, prev_start, prev_end)
+        plan_text.append(f"• {name}: {act['lecturas']} lectura(s) en el período (anterior: {ant['lecturas']}) · {done} de {total} en total ({pct} %)")
+        if act["dias"]:
+            plan_text.append(f"   Días con lectura: {lista_dias(act['dias'])}")
+    comparacion_texto = [
+        f"• Días de uso: {prev['dias_uso']} → {stats['dias_uso']} ({texto_delta(stats['dias_uso'], prev['dias_uso'])})",
+        f"• Aperturas del programa: {prev['aperturas']} → {stats['aperturas']} ({texto_delta(stats['aperturas'], prev['aperturas'])})",
+        f"• Capítulos consultados: {prev['lecturas']} → {stats['lecturas']} ({texto_delta(stats['lecturas'], prev['lecturas'])})",
+        f"• Sesiones de concentración: {prev['sesiones']} → {stats['sesiones']} ({texto_delta(stats['sesiones'], prev['sesiones'])})",
+    ]
+    if stats["mensajes"] or prev["mensajes"]:
+        comparacion_texto.append(f"• Mensajes preparados o actualizados: {prev['mensajes']} → {stats['mensajes']} ({texto_delta(stats['mensajes'], prev['mensajes'])})")
+    body = f"""{title} de Mi Estudio Bíblico
+Período: {start.strftime('%d-%m-%Y')} al {end.strftime('%d-%m-%Y')}
+
+Tu avance
+• Días de uso: {stats['dias_uso']}
+• Aperturas del programa: {stats['aperturas']}
+• Capítulos consultados: {stats['lecturas']}
+• Mensajes preparados o actualizados: {stats['mensajes']}
+• Reflexiones guardadas en el plan: {stats['reflexiones']}
+• Sesiones de concentración: {stats['sesiones']} ({stats['minutos_concentracion']} minutos)
+• Constancia actual: {stats['racha']} día(s)
+
+Comparación con {comparacion}
+{chr(10).join(comparacion_texto)}
+
+Tus planes
+{chr(10).join(plan_text) if plan_text else '• El progreso del plan se sincronizará al abrirlo.'}
+
+Texto bíblico
+“{verse['texto']}”
+{verse['referencia']} · RVR1960
+
+Sigue avanzando con calma y constancia.
+
+— Mi Estudio Bíblico"""
+    return {"titulo":title,"periodo_inicio":str(start),"periodo_fin":str(end),"periodo_anterior_inicio":str(prev_start),"periodo_anterior_fin":str(prev_end),"estadisticas":stats,"versiculo":verse,"texto":body}
+
+def plan_lag(plan):
+    """Días de atraso reales. Usa el valor del cliente y, si falta, lo calcula
+    el servidor desde la fecha de inicio, así se avisa aunque no se abra la app."""
+    try:
+        lag = int(plan.get("dias_atraso") or 0)
+    except Exception:
+        lag = 0
+    try:
+        inicio = str(plan.get("inicio") or "")[:10]
+        if inicio:
+            start = datetime.strptime(inicio, "%Y-%m-%d").date()
+            esperado = (datetime.now().date() - start).days + 1
+            if esperado > 0:
+                lag = max(lag, esperado - int(plan.get("dia_actual") or 0))
+    except Exception:
+        pass
+    return max(0, lag)
+
+
+def plan_name(plan):
+    return "Biblia cronológica" if plan.get("modo") == "cronologico" else "Nuevo y Antiguo Testamento"
+
+
+def plan_dia_esperado(plan):
+    """Día del plan que toca hoy, calculado desde la fecha de inicio."""
+    try:
+        inicio = str(plan.get("inicio") or "")[:10]
+        start = datetime.strptime(inicio, "%Y-%m-%d").date()
+        return max(1, min(365, (datetime.now().date() - start).days + 1))
+    except Exception:
+        return 1
+
+
+def plan_pendientes(plan, limite=25):
+    """Lecturas pendientes, calculadas en el servidor a partir del horario del plan.
+
+    Así el correo sabe qué falta aunque el día no se haya abierto la app.
+    """
+    try:
+        datos = json.loads(plan.get("datos") or "{}")
+    except Exception:
+        datos = {}
+    esperado = plan_dia_esperado(plan)
+    horario = datos.get("horario")
+    if not isinstance(horario, dict) or not horario:
+        # Respaldo: lo que mandó el cliente la última vez.
+        items = [x for x in (datos.get("pendientes") or []) if isinstance(x, str)][:limite]
+        total = int(datos.get("pendientes_total") or len(items))
+        hoy = [x for x in items if x.startswith(f"{esperado}|")]
+        return {"items": items, "total": total, "hoy": hoy, "hoy_total": len(hoy), "esperado": esperado}
+    completadas = set(datos.get("completed") or {})
+    items, hoy, total, hoy_total = [], [], 0, 0
+    for dia in range(1, esperado + 1):
+        for par in (horario.get(str(dia)) or []):
+            if not isinstance(par, (list, tuple)) or len(par) < 2:
+                continue
+            clave, texto = str(par[0]), str(par[1])
+            if clave in completadas:
+                continue
+            trozos = clave.split(":")
+            momento = "Noche" if len(trozos) > 1 and trozos[1] == "evening" else "Mañana"
+            etiqueta = f"{dia}|{momento}|{texto}"
+            total += 1
+            if len(items) < limite:
+                items.append(etiqueta)
+            if dia == esperado:
+                hoy_total += 1
+                if len(hoy) < limite:
+                    hoy.append(etiqueta)
+    return {"items": items, "total": total, "hoy": hoy, "hoy_total": hoy_total, "esperado": esperado}
+
+
+def lista_pendientes(etiquetas, total):
+    if not etiquetas:
+        return ""
+    lineas = []
+    for raw in etiquetas:
+        partes = raw.split("|")
+        if len(partes) == 3:
+            dia, momento, texto = partes
+            lineas.append(f"• Día {dia} · {momento} — {texto}")
+        else:
+            lineas.append(f"• {raw}")
+    extra = int(total or 0) - len(etiquetas)
+    if extra > 0:
+        lineas.append(f"• …y {extra} lectura(s) más")
+    return "\n".join(lineas)
+
+
+def build_late_message(plan):
+    """Aviso de las 20:30: no se leyó el plan hoy (o se arrastran días)."""
+    verse = report_verse()
+    atraso = plan_lag(plan)
+    pend = plan_pendientes(plan)
+    name = plan_name(plan)
+    if atraso > 0:
+        intro = f"Tu plan {name} lleva aproximadamente {atraso} día(s) pendiente(s)."
+        encabezado = "Para ponerte al día, esto es lo que te falta leer:"
+    else:
+        intro = f"Hoy todavía no completas la lectura de tu plan {name}."
+        encabezado = "Te toca leer:"
+    lista = lista_pendientes(pend["items"], pend["total"])
+    if lista:
+        intro += "\n\n" + encabezado + "\n" + lista
+    body = f"""Hola Miguel:
+
+{intro}
+
+No te desanimes: puedes retomarlo hoy, aunque sea con una sola lectura.
+
+“{verse['texto']}”
+{verse['referencia']} · RVR1960
+
+— Mi Estudio Bíblico"""
+    return body
+
+
+def build_daily_message(plan):
+    """Recordatorio diario de las 08:00 con la lectura que toca hoy."""
+    verse = report_verse()
+    pend = plan_pendientes(plan)
+    name = plan_name(plan)
+    if pend["hoy"]:
+        intro = (f"Buenos días. Esta es la lectura de hoy en tu plan {name} "
+                 f"(día {pend['esperado']} de 365):")
+        intro += "\n\n" + lista_pendientes(pend["hoy"], pend["hoy_total"])
+        atrasadas = max(0, pend["total"] - pend["hoy_total"])
+        if atrasadas > 0:
+            intro += (f"\n\nAdemás tienes {atrasadas} lectura(s) de días anteriores pendientes. "
+                      "Si puedes, ve leyendo de a poco para ponerte al día.")
+    else:
+        intro = (f"Buenos días. Ya tienes completa la lectura de hoy en tu plan {name} "
+                 f"(día {pend['esperado']} de 365). ¡Buen trabajo!")
+    body = f"""Hola Miguel:
+
+{intro}
+
+“{verse['texto']}”
+{verse['referencia']} · RVR1960
+
+— Mi Estudio Bíblico"""
+    return body
+
+def already_sent(kind, period):
+    with db() as con: return con.execute("SELECT 1 FROM envios_automaticos WHERE tipo=? AND periodo=?",(kind,period)).fetchone() is not None
+
+def record_delivery(kind, period, state):
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO envios_automaticos(tipo,periodo,estado,enviado) VALUES(?,?,?,datetime('now','localtime'))",(kind,period,state[:500]))
+
+def automatic_mail_worker():
+    while True:
+        try:
+            now = datetime.now(); settings = automation_settings(); clock = now.strftime("%H:%M")
+            configured = bool(load_email_config(True).get("app_password"))
+            recipient = settings.get("recipient", "")
+            # Recordatorio diario: qué te toca leer hoy (08:00)
+            if configured and settings.get("daily_enabled") and clock == settings.get("daily_hour"):
+                for plan in plan_rows():
+                    period = now.strftime("%Y-%m-%d") + ":" + plan["modo"]
+                    if not already_sent("diario",period):
+                        try:
+                            send_gmail("Tu lectura de hoy · Mi Estudio Bíblico", build_daily_message(plan), recipient)
+                            record_delivery("diario",period,"Enviado")
+                        except Exception as exc: print("Error en recordatorio diario:",exc)
+            # Aviso si no se leyó el plan (20:30)
+            if configured and settings.get("late_enabled") and clock == settings.get("late_hour"):
+                for plan in plan_rows():
+                    lag = plan_lag(plan)
+                    pend = plan_pendientes(plan)
+                    period = now.strftime("%Y-%m-%d") + ":" + plan["modo"]
+                    no_leyo_hoy = int(pend.get("hoy_total") or 0) > 0
+                    if (lag >= int(settings.get("late_days",1)) or no_leyo_hoy) and not already_sent("atraso",period):
+                        try:
+                            send_gmail("Un mensaje para retomar tu lectura", build_late_message(plan), recipient)
+                            record_delivery("atraso",period,"Enviado")
+                        except Exception as exc: print("Error en aviso de atraso:",exc)
+            weekly_period = now.strftime("%G-W%V")
+            if configured and settings.get("weekly_enabled") and now.weekday() == int(settings.get("weekly_day",6)) and clock == settings.get("weekly_hour") and not already_sent("semanal",weekly_period):
+                try:
+                    report=build_report("weekly",now); send_gmail("Mi Estudio Bíblico — Resumen semanal",report["texto"],recipient); record_delivery("semanal",weekly_period,"Enviado")
+                except Exception as exc: print("Error en informe semanal:",exc)
+            monthly_period = now.strftime("%Y-%m")
+            if configured and settings.get("monthly_enabled") and now.day == int(settings.get("monthly_day",1)) and clock == settings.get("monthly_hour") and not already_sent("mensual",monthly_period):
+                try:
+                    report=build_report("monthly",now); send_gmail("Mi Estudio Bíblico — Informe mensual",report["texto"],recipient); record_delivery("mensual",monthly_period,"Enviado")
+                except Exception as exc: print("Error en informe mensual:",exc)
+        except Exception as exc: print("Error en automatizaciones:",exc)
+        time.sleep(30)
+
+def start_automatic_mail_worker():
+    threading.Thread(target=automatic_mail_worker,name="informes-automaticos",daemon=True).start()
+
+
+def load_book(book, version="rvr1960"):
+    if version not in BIBLE_VERSIONS: raise ValueError("Versión bíblica desconocida")
+    if book not in BOOK_NAMES: raise ValueError("Libro desconocido")
+    cache_key = (version, book)
+    if cache_key in _cache: return _cache[cache_key]
+    if version == "lbla":
+        value = json.loads((BIBLE_LBLA / f"{book}.json").read_text(encoding="utf-8"))
+    else:
+        raw = (BIBLE_RVR / f"{book}.js").read_text(encoding="utf-8").strip()
+        raw = re.sub(r'^(?:export\s+default|module\.exports\s*=)\s*', '', raw)
+        raw = raw[:-1] if raw.endswith(';') else raw
+        value = ast.literal_eval(raw)
+    _cache[cache_key] = value
+    return value
+
+
+STOPWORDS = {"para","como","pero","porque","cuando","donde","desde","hasta","entre","sobre","ante","bajo","cabe","contra","durante","mediante","segun","sin","tras","que","del","las","los","una","uno","unos","unas","con","por","más","mas","sus","esta","este","estos","estas","esa","ese","eso","son","sea","ser","fue","han","hay","muy","todo","toda","todos","todas","cada","también","tambien","mismo","misma","puede","pueden","nos","nuestro","nuestra","Dios","dios","señor","Señor","él","ella","ellos","ellas","al","el","la","y","o","u","e","a","de","en","es","se","su","lo","le","ya","si","no"}
+BOOK_PATTERN = r"(?:Génesis|Genesis|Éxodo|Exodo|Levítico|Levitico|Números|Numeros|Deuteronomio|Josué|Josue|Jueces|Rut|[12]\s*Samuel|[12]\s*Reyes|[12]\s*Crónicas|[12]\s*Cronicas|Esdras|Nehemías|Nehemias|Ester|Job|Salmos?|Proverbios|Eclesiastés|Eclesiastes|Cantares|Isaías|Isaias|Jeremías|Jeremias|Lamentaciones|Ezequiel|Daniel|Oseas|Joel|Amós|Amos|Abdías|Abdias|Jonás|Jonas|Miqueas|Nahúm|Nahum|Habacuc|Sofonías|Sofonias|Hageo|Zacarías|Zacarias|Malaquías|Malaquias|Mateo|Marcos|Lucas|Juan|Hechos|Romanos|[12]\s*Corintios|Gálatas|Galatas|Efesios|Filipenses|Colosenses|[12]\s*Tesalonicenses|[12]\s*Timoteo|Tito|Filemón|Filemon|Hebreos|Santiago|[12]\s*Pedro|[123]\s*Juan|Judas|Apocalipsis)"
+# Abreviaturas que usan los comentarios bíblicos (Is. 53:7 · Jn. 1:29 · 1 P. 1:19…)
+BOOK_ABBRS = "Gen|Éx|Ex|Lv|Nm|Dt|Jos|Jue|Rt|Sal|Pr|Ec|Ct|Is|Jr|Lm|Ez|Dn|Os|Jl|Am|Ab|Jon|Mq|Na|Hab|So|Hag|Za|Ml|Mt|Mr|Lc|Jn|Hch|Ro|Gál|Ef|Fil|Col|Tit|Flm|Heb|Stg|Jud|Ap|[123]\\s*(?:Sm|Re|Cr|Co|Ts|Ti|P|Jn|Jo)"
+BOOK_REF_RE = re.compile(r"(?<![A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9])(?:" + BOOK_PATTERN[3:-1] + "|" + BOOK_ABBRS + r")\s*\.?\s*(\d{1,3})\s*[:.,]\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?", re.IGNORECASE)
+
+# Pista rápida: solo tiene sentido buscar "Is. 53:7" donde haya un número con dos puntos.
+REF_HINT_RE = re.compile(r"\d{1,3}\s*:\s*\d{1,3}")
+
+def bible_references(text, limit=80):
+    """Referencias bíblicas del texto, con abreviaturas (Is. 53:7 · 1 P. 1:19)."""
+    refs, seen = [], set()
+    for match in BOOK_REF_RE.finditer(text):
+        crudo = re.sub(r"\s+", " ", match.group(0)).strip()
+        book = re.split(r"\s*\d{1,3}\s*[:.,]", crudo, maxsplit=1)[0].strip()
+        ref = f"{book} {match.group(1)}:{match.group(2)}"
+        if match.group(3): ref += f"-{match.group(3)}"
+        key = re.sub(r"[\s.]+", "", ref).casefold()
+        if key not in seen:
+            seen.add(key); refs.append(ref)
+        if len(refs) >= limit: break
+    return refs
+
+def clean_text(text):
+    text = text.replace("\x00", " ").replace("\r", "\n")
+    text = re.sub(r"(?<=\w)-\n(?=\w)", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def analyze_document(text):
+    clean = clean_text(text)
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", clean)
+    normalized = [w.casefold() for w in tokens if w.casefold() not in {x.casefold() for x in STOPWORDS}]
+    counts = Counter(normalized)
+    keywords = [{"palabra": word, "frecuencia": count} for word,count in counts.most_common(12)]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", clean) if 45 <= len(s.strip()) <= 500]
+    scored = []
+    for position,sentence in enumerate(sentences[:300]):
+        words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", sentence.casefold())
+        score = sum(counts.get(w, 0) for w in words) / max(len(words), 1)
+        score *= max(0.7, 1.15 - position / 500)
+        scored.append((score, position, sentence))
+    chosen = sorted(sorted(scored, reverse=True)[:5], key=lambda x:x[1])
+    summary_parts = [x[2] for x in chosen]
+    summary = " ".join(summary_parts) if summary_parts else clean[:1200]
+    refs = bible_references(clean)
+    top = [k["palabra"] for k in keywords[:5]]
+    questions = [f"¿Qué enseña el documento acerca de {word}?" for word in top[:3]]
+    if refs: questions.append("¿Cómo apoyan las referencias bíblicas las ideas principales del material?")
+    outline = []
+    for i,part in enumerate(summary_parts[:3],1):
+        short = part[:180].rstrip(" ,;:")
+        outline.append({"punto":i,"idea":short + ("…" if len(part)>180 else "")})
+    return {"resumen":summary[:3000],"palabras_clave":keywords,"referencias":refs,"preguntas":questions,"bosquejo":outline,"caracteres":len(clean),"palabras":len(tokens)}
+
+def document_meta_path(doc_id):
+    return DOCUMENTS / f"{doc_id}.json"
+
+def load_document_meta(doc_id):
+    path = document_meta_path(doc_id)
+    if not path.is_file() or not re.fullmatch(r"[a-f0-9]{12}", doc_id): raise ValueError("Documento no encontrado")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta = classify_document_meta(meta)
+    path.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding="utf-8")
+    return meta
+
+def save_uploaded_pdf(filename, content):
+    if len(content) > 150 * 1024 * 1024: raise ValueError("El PDF supera el límite de 150 MB")
+    if not content.startswith(b"%PDF"): raise ValueError("El archivo seleccionado no parece ser un PDF válido")
+    safe = re.sub(r"[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ._ -]+", "_", filename or "documento.pdf").strip() or "documento.pdf"
+    if not safe.lower().endswith(".pdf"): safe += ".pdf"
+    doc_id = uuid.uuid4().hex[:12]
+    pdf_path = DOCUMENTS / f"{doc_id}.pdf"
+    txt_path = DOCUMENTS / f"{doc_id}.txt"
+    pdf_path.write_bytes(content)
+    result = subprocess.run(["pdftotext", "-layout", str(pdf_path), str(txt_path)], capture_output=True, text=True)
+    extracted = txt_path.read_text(encoding="utf-8", errors="replace") if txt_path.exists() else ""
+    extracted = clean_text(extracted)
+    state = "analizado" if len(extracted) >= 80 else "requiere_ocr"
+    analysis = analyze_document(extracted) if extracted else {"resumen":"No se detectó texto digital. Este PDF probablemente está escaneado y requiere OCR.","palabras_clave":[],"referencias":[],"preguntas":[],"bosquejo":[],"caracteres":0,"palabras":0}
+    meta = {"id":doc_id,"nombre":safe,"archivo":pdf_path.name,"texto":txt_path.name,"tamano":len(content),"estado":state,"creado":datetime_now(),"error_extraccion":result.stderr.strip(),"analisis":analysis,"notas":"","fichas":[]}
+    document_meta_path(doc_id).write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding="utf-8")
+    return meta
+
+def datetime_now():
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def normalize_search(value):
+    import unicodedata
+    value = unicodedata.normalize("NFD", value.casefold())
+    return "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
+
+# ── Calidad del texto y búsqueda con palabras completas ─────────────────────
+# Muchos PDF traen fuentes sin mapa Unicode: el texto sale cifrado
+# (ej. "HHHD(%V&'D'&J") y arruina resúmenes, ideas y búsquedas.
+SUSPICIOUS_CHARS = set("@#$%^&*{}[]<>\\|~_")
+
+FUNCTION_WORDS = {
+    "el","la","los","las","un","una","unos","unas","al","lo","le","les","la",
+    "de","del","en","con","por","para","sin","sobre","entre","desde","hasta",
+    "contra","ante","bajo","segun","tras","durante","mediante","hacia",
+    "y","o","u","e","ni","sino","pero","porque","pues","aunque","si","como",
+    "cuando","donde","que","cual","cuales","quien","quienes","cuanto","cuantos",
+    "acerca","respecto","junto","mientras","dentro","fuera","hacia","segun",
+    "su","sus","tu","tus","mi","mis","nuestro","nuestra","nuestros","nuestras",
+    "este","esta","estos","estas","ese","esa","esos","esas","aquel","aquella",
+    "yo","el","ella","ellos","ellas","nosotros","vosotros","usted","ustedes",
+    "me","te","se","nos","os","algo","alguien","nada","nadie",
+    "todo","toda","todos","todas","cada","otro","otra","otros","otras",
+    "mismo","misma","mismos","mismas","mas","muy","tambien","solo","ya","bien",
+    "es","son","era","eran","fue","fueron","ser","esta","estan","hay","habia",
+    "han","ha","haber","hace","hacen","tiene","tienen","puede","pueden",
+    "debe","deben","va","van","uno","dos","tres","cuatro","cinco","veces","vez",
+}
+
+# Términos de gramática y crítica textual: abundan en comentarios bíblicos pero no
+# dicen de qué trata el libro, así que no sirven como "tema principal".
+TERMINOS_TECNICOS = {
+    "caso","verbo","singular","plural","nominativo","acusativo","dativo","genitivo",
+    "vocativo","articulo","genero","numero","persona","adjetivo","adverbio",
+    "sustantivo","relativo","etimologia","semantica","variante",
+    "preposicion","conjuncion","pronombre","conjugacion","flexion","tiempo",
+    "aoristo","imperfecto","presente","futuro","imperativo","subjuntivo","indicativo",
+    "participio","infinitivo","raiz","lexema","lexico","morfologia","sintaxis",
+    "griego","hebreo","arameo","manuscrito","version","traduccion","texto",
+    "versiculo","capitulo","voz","forma","termino","lexico",
+}
+
+# Un único patrón para detectar notas de gramática en un párrafo de una pasada.
+TECNICO_RE = re.compile(r"(?<![a-z0-9])(?:" +
+                        "|".join(sorted(TERMINOS_TECNICOS, key=len, reverse=True)) +
+                        r")(?![a-z0-9])")
+
+TEMA_CACHE = {}
+
+def search_words(value, min_len=3):
+    """Palabras con contenido de una pregunta o tema (sin artículos ni conectores)."""
+    return [w for w in re.findall(r"[a-z0-9]+", normalize_search(str(value or "")))
+            if len(w) >= min_len and w not in FUNCTION_WORDS]
+
+def has_word(normalized_text, word):
+    """Coincidencia por palabra completa: 'fe' no debe encontrar 'defensa'."""
+    return re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", normalized_text) is not None
+
+def legibility_profile(text):
+    visible = [ch for ch in text if not ch.isspace()]
+    if not visible: return (1.0, 0.0, 0.0)
+    symbols = sum(ch in SUSPICIOUS_CHARS for ch in visible) / len(visible)
+    tokens = re.findall(r"[a-záéíóúüñ]{2,}", text.casefold())
+    common = (sum(1 for w in tokens if w in FUNCTION_WORDS) / len(tokens)) if tokens else 0.0
+    letters = [ch for ch in text.casefold() if ch.isalpha()]
+    vowels = (sum(ch in "aeiouáéíóúü" for ch in letters) / len(letters)) if letters else 0.0
+    return symbols, common, vowels
+
+def is_legible_text(text):
+    """False cuando el texto viene cifrado/roto y no se puede leer."""
+    if not text: return False
+    symbols, common, vowels = legibility_profile(text)
+    return symbols < 0.06 and common >= 0.05 and vowels >= 0.28
+
+# Caché de páginas: limpiar y normalizar 4 MB en cada búsqueda tardaba segundos.
+PAGES_CACHE = {}
+
+def document_pages(meta):
+    """Páginas del documento, ya limpias y normalizadas, guardadas en caché."""
+    text_name = meta.get("texto")
+    if not text_name or not (DOCUMENTS / text_name).is_file():
+        raise ValueError("No se pudo leer el texto del documento")
+    path = DOCUMENTS / text_name
+    firma = f"{path.stat().st_mtime_ns}:{path.stat().st_size}"
+    hit = PAGES_CACHE.get(text_name)
+    if hit and hit["firma"] == firma:
+        return hit["paginas"]
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    paginas = [{"texto": clean_text(p), "norm": ""} for p in raw.split("\f")]
+    for p in paginas:
+        p["norm"] = normalize_search(p["texto"])
+    if len(PAGES_CACHE) > 2:
+        PAGES_CACHE.clear()
+    PAGES_CACHE[text_name] = {"firma": firma, "paginas": paginas}
+    return paginas
+
+def page_paragraphs(page, pattern, min_len=0, max_len=0):
+    """Divide la página y devuelve pares (texto, texto normalizado), con caché."""
+    def cumple(t):
+        return len(t) >= min_len and (max_len == 0 or len(t) <= max_len)
+    clave = f"{pattern}|{min_len}|{max_len}"
+    bloques = page.setdefault("bloques", {})
+    hit = bloques.get(clave)
+    if hit is not None:
+        return hit
+    partes_t = [p.strip() for p in re.split(pattern, page["texto"])]
+    partes_n = [p.strip() for p in re.split(pattern, page["norm"])]
+    if len(partes_t) != len(partes_n):  # casofold muy raro: se normaliza aparte
+        salida = [(t, normalize_search(t)) for t in partes_t if cumple(t)]
+    else:
+        salida = [(t, n) for t, n in zip(partes_t, partes_n) if cumple(t)]
+    if len(bloques) > 4:
+        bloques.clear()
+    bloques[clave] = salida
+    return salida
+
+_VARIANTES = {"a": "áà", "e": "éè", "i": "íì", "o": "óò", "u": "úù", "n": "ñ"}
+
+
+def _patron_palabra(palabra):
+    """Patrón para hallar una palabra normalizada dentro del texto con acentos."""
+    return "".join("[" + c + _VARIANTES.get(c, "") + "]" if c.isalpha() else re.escape(c)
+                   for c in palabra)
+
+
+def tema_principal(meta):
+    """Tema del libro: palabras que aparecen en muchas páginas distintas.
+
+    En los comentarios bíblicos las notas de gramática («caso nominativo», «artículo
+    determinado») son lo más frecuente; se descartan esos párrafos para que el tema
+    refleje el fondo del texto y no la morfología."""
+    text_name = meta.get("texto") or ""
+    path = DOCUMENTS / text_name
+    if not text_name or not path.is_file():
+        return []
+    firma = f"{path.stat().st_mtime_ns}:{path.stat().st_size}"
+    hit = TEMA_CACHE.get(text_name)
+    if hit and hit.get("firma") == firma:
+        return hit["tema"]
+    pages = document_pages(meta)
+    paginas_de, original = {}, {}
+    min_paginas = max(5, len(pages) // 100)
+    for page in pages:
+        if not page["texto"]:
+            continue
+        vistos = set()
+        for crudo, norm in page_paragraphs(page, r"\n\s*\n", 80):
+            if len(TECNICO_RE.findall(norm)) >= 3:
+                continue  # es una nota de sintaxis, no el fondo
+            for w in re.findall(r"[a-záéíóúüñ]{4,}", norm):
+                if w in FUNCTION_WORDS or w in TERMINOS_TECNICOS:
+                    continue
+                vistos.add(w)
+            if vistos:
+                for w in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", crudo):
+                    original.setdefault(normalize_search(w), w)
+        for w in vistos:
+            paginas_de[w] = paginas_de.get(w, 0) + 1
+    orden = sorted((w for w, n in paginas_de.items() if n >= min_paginas),
+                   key=lambda w: (paginas_de[w], len(w)), reverse=True)
+    tema = [original.get(w, w) for w in orden[:5]]
+    if len(TEMA_CACHE) > 4:
+        TEMA_CACHE.clear()
+    TEMA_CACHE[text_name] = {"firma": firma, "tema": tema}
+    return tema
+
+
+def _salta_inicio_cifrado(texto):
+    """Si el fragmento arranca con una cita griega cifrada («KaiV a[/dousin…»),
+    se muestra desde la primera frase legible."""
+    oraciones = _oraciones(texto)
+    if (len(oraciones) > 1 and len(oraciones[0]) < 220
+            and not is_legible_text(oraciones[0]) and is_legible_text(oraciones[1])):
+        return texto[len(oraciones[0]):].lstrip()
+    return texto
+
+
+def _contexto(paragraph, before, after, palabras=(), limite=1800):
+    """Texto mostrado: el párrafo coincidente + sus vecinos, sin pasarse del límite.
+    Si el párrafo es más largo que el límite, se corta alrededor de la primera
+    palabra que hizo coincidir (antes se cortaba por el principio y el texto
+    mostrado no contenía nada que ver con la pregunta)."""
+    body = clean_text(paragraph)
+    if len(body) >= limite:
+        posiciones = []
+        for palabra in palabras:
+            hit = re.search(_patron_palabra(palabra), body, re.IGNORECASE)
+            if hit:
+                posiciones.append(hit.start())
+        inicio = max(0, min(posiciones) - limite // 4) if posiciones else 0
+        return _salta_inicio_cifrado(("…" if inicio else "") + body[inicio:inicio + limite])
+    izq, der = clean_text(before), clean_text(after)
+    disponible = limite - len(body)
+    izq = izq[-min(len(izq), disponible // 2):]
+    der = der[:max(0, disponible - len(izq))]
+    return _salta_inicio_cifrado(clean_text(" ".join(x for x in (izq, body, der) if x))[:limite])
+
+def search_document_topic(meta, topic):
+    topic = clean_text(topic)[:150]
+    if len(topic) < 2: raise ValueError("Escribe un tema para analizar")
+    text_name = meta.get("texto")
+    if not text_name or not (DOCUMENTS / text_name).is_file():
+        raise ValueError("El texto completo fue eliminado para liberar espacio; las fichas guardadas siguen disponibles")
+    pages = document_pages(meta)
+    needle = normalize_search(topic)
+    words = search_words(topic)
+    required = max(1, (len(words)+1)//2)
+    # Palabras poco frecuentes en el documento: con una sola basta. En una pregunta
+    # de 4 palabras casi siempre solo una es el tema ("gracia", "autor"...).
+    raras = set()
+    if len(words) > 1:
+        umbral = max(20, len(pages) // 20)
+        raras = {w for w in words if sum(1 for p in pages if w in p["norm"]) <= umbral}
+    fuertes, debiles, descartados = [], [], 0
+    for page_no,page in enumerate(pages,1):
+        if not page["texto"]: continue
+        bloques = page_paragraphs(page, r"\n\s*\n", 1)
+        if len(bloques) <= 1:
+            bloques = page_paragraphs(page, r"(?<=[.!?])\s+", 1)
+        for idx,(paragraph, normalized) in enumerate(bloques):
+            # Un solo barrido: coincide exacta (o todas las palabras) y, si no,
+            # la búsqueda flexible con al menos la mitad de las palabras.
+            exact = has_word(normalized, needle) if " " not in needle else needle in normalized
+            coincidentes = [word for word in words if has_word(normalized, word)]
+            matched = len(coincidentes)
+            flexible = matched >= required or any(w in raras for w in coincidentes)
+            if not (exact or (words and flexible)): continue
+            if not is_legible_text(paragraph):
+                descartados += 1
+                continue
+            before = bloques[idx-1][0] if idx > 0 else ""
+            after = bloques[idx+1][0] if idx+1 < len(bloques) else ""
+            anclas = coincidentes or ([needle] if exact else [])
+            context = _contexto(paragraph, before, after, anclas)
+            item = {"pagina":page_no,"fragmento":context,
+                    "puntaje": (10.0 if exact else 0.0) + matched * 2.0 + min(len(paragraph), 1200) / 1200}
+            if exact or matched == len(words):
+                fuertes.append(item)
+            else:
+                debiles.append(item)
+        if len(fuertes) >= 40 or len(debiles) >= 60: break
+    # Se suman ambos niveles: directos (todas las palabras) y flexibles (al
+    # menos la mitad); los dos son evidencia real del documento.
+    findings = fuertes + debiles
+    findings.sort(key=lambda x: x["puntaje"], reverse=True)
+    top = sorted(findings[:12], key=lambda x: x["pagina"])
+    joined = "\n\n".join(x["fragmento"] for x in top)
+    analysis = analyze_document(joined) if joined else {"resumen":"No se encontraron coincidencias suficientes para este tema.","palabras_clave":[],"referencias":[],"preguntas":[],"bosquejo":[],"caracteres":0,"palabras":0}
+    return {"tema":topic,"coincidencias":len(findings),"coincidencias_directas":len(fuertes),"paginas":sorted(set(x["pagina"] for x in findings)),"fragmentos":top,"descartados_cifrados":descartados,"analisis":analysis}
+
+# BIBLIOTECA_INTELIGENTE_LOCAL_V1
+def smart_document_fragments(meta, query="", limit=8):
+    text_name = meta.get("texto")
+    if not text_name or not (DOCUMENTS / text_name).is_file():
+        raise ValueError("El texto completo fue eliminado; el análisis guardado sigue disponible, pero no se pueden preparar nuevos fragmentos")
+
+    pages = document_pages(meta)
+    query_words = search_words(query)
+
+    # Palabras clave del documento, con peso: las que aparecen en casi todas las
+    # páginas son genéricas ("caso", "singular") y pesan menos que las específicas.
+    weights = {}
+    for k in (meta.get("analisis") or {}).get("palabras_clave", [])[:10]:
+        if not isinstance(k, dict): continue
+        norm_kw = normalize_search(str(k.get("palabra", "")).strip())
+        if not norm_kw or norm_kw in weights: continue
+        # Términos gramaticales: en un comentario bíblico dominan y arrastran la
+        # selección hacia notas de sintaxis en vez de hacia el fondo del texto.
+        if norm_kw in TERMINOS_TECNICOS: continue
+        en_paginas = sum(1 for p in pages if norm_kw in p["norm"])
+        weights[norm_kw] = 0.35 if en_paginas > max(4, len(pages) * 0.25) else 1.0
+    keywords = list(weights)
+
+    terms = {w: "q" for w in query_words}
+    for w in keywords:
+        terms.setdefault(w, "k")
+    matcher = None
+    if terms:
+        alt = "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True))
+        matcher = re.compile(r"(?<![a-z0-9])(?:" + alt + r")(?![a-z0-9])")
+
+    candidates = []
+    total_pages = max(1, len(pages))
+    for page_no, page in enumerate(pages, 1):
+        if not page["texto"]:
+            continue
+        # Por párrafo (no por frase): separar en frases parte las referencias
+        # ("Is. 53:7" quedaría como "Is." + "53:7") y se pierde el bono de citas.
+        paragraphs = page_paragraphs(page, r"\n\s*\n", 80)
+        for idx, (paragraph, norm) in enumerate(paragraphs):
+            hits = set(matcher.findall(norm)) if matcher else set()
+            qscore = sum(6 for w in hits if terms.get(w) == "q")
+            # Las palabras clave aportan poco: en comentarios bíblicos dominan los
+            # términos gramaticales (caso, artículo, singular) y eso tapa el fondo.
+            kscore = min(1.5, sum(weights.get(w, 1.0) for w in hits if terms.get(w) == "k"))
+            refs = len(BOOK_REF_RE.findall(norm)) if REF_HINT_RE.search(norm) else 0
+            refscore = min(3.0, 1.5 * refs)
+            spread_bonus = 1.0 - abs((page_no / total_pages) - 0.5) * 0.15
+            score = (qscore + kscore + refscore + min(len(paragraph), 1200) / 1200) * spread_bonus
+            # Se penaliza si el fragmento arranca en texto cifrado/griego o a
+            # media frase: la evidencia tiene que empezar por algo legible.
+            primera = re.split(r"(?<=[.!?])\s+", paragraph, maxsplit=1)[0]
+            primera_letra = next((c for c in primera if c.isalpha()), "")
+            if (len(primera) < 40 or not is_legible_text(primera)
+                    or primera_letra.islower()):
+                score *= 0.8
+            # Las notas de gramática son útiles, pero no son el fondo del texto.
+            if len(TECNICO_RE.findall(norm)) >= 3:
+                score *= 0.72
+            if "...." in paragraph:
+                score *= 0.5   # línea de índice («16- ¿Está la salvación?….. (191)»)
+            if score <= 0:
+                continue
+            candidates.append((score, page_no, idx, paragraph[:1800]))
+
+    if not candidates:
+        raise ValueError("No se encontró texto suficiente para preparar el análisis")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Se prefiere texto legible: los párrafos cifrados solo entran como respaldo.
+    legibles, respaldo, usadas, revisados = [], [], set(), 0
+    for score, page_no, idx, paragraph in candidates:
+        if len(legibles) >= limit and len(respaldo) >= limit:
+            break
+        if page_no in usadas:
+            continue
+        if revisados >= 400:
+            break
+        revisados += 1
+        usadas.add(page_no)
+        if is_legible_text(paragraph):
+            if len(legibles) < limit:
+                legibles.append((score, page_no, idx, paragraph))
+        elif len(respaldo) < limit:
+            respaldo.append((score, page_no, idx, paragraph))
+
+    picked = legibles[:limit]
+    if len(picked) < limit:
+        picked += respaldo[:limit - len(picked)]
+    if len(picked) < limit:
+        elegidos = {(x[1], x[3]) for x in picked}
+        for item in candidates:
+            if len(picked) >= limit:
+                break
+            if (item[1], item[3]) in elegidos:
+                continue
+            elegidos.add((item[1], item[3]))
+            picked.append(item)
+
+    selected = [{"pagina": p, "fragmento": _salta_inicio_cifrado(t), "puntaje_local": round(s, 2)} for s, p, _, t in picked]
+    selected.sort(key=lambda x: x["pagina"])
+    return selected
+
+
+def _oraciones(text):
+    """Divide en frases sin cortar citas bíblicas («Is. 53:7» no se parte en «Is.»)."""
+    partes = re.split(r"(?<=[.!?])\s+", str(text or "").strip())
+    salida = []
+    for parte in partes:
+        parte = parte.strip()
+        if (salida and re.search(r"[\s(][A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{1,3}\.$", salida[-1])
+                and re.match(r"\d", parte)):
+            salida[-1] = salida[-1] + " " + parte
+        else:
+            salida.append(parte)
+    return salida
+
+
+def _first_sentences(text, max_len=600):
+    """Primera frase con contenido, recortada en límite de palabra."""
+    for sentence in _oraciones(text):
+        sentence = " ".join(sentence.split())
+        if len(sentence) >= 40:
+            if len(sentence) > max_len:
+                sentence = sentence[:max_len].rsplit(" ", 1)[0] + "…"
+            return sentence
+    return ""
+
+
+# Caché del análisis previo: no depende de la pregunta, solo del documento,
+# así que desde la segunda vez se responde al tiro en vez de rebarrer 1000+ páginas.
+SMART_PREVIEW_CACHE = {}
+
+def build_local_smart_preview(meta):
+    text_name = meta.get("texto") or ""
+    path = DOCUMENTS / text_name if text_name else None
+    firma = f"{path.stat().st_mtime_ns}:{path.stat().st_size}" if path and path.is_file() else ""
+    if firma:
+        hit = SMART_PREVIEW_CACHE.get(text_name)
+        if hit and hit.get("firma") == firma:
+            return hit["resultado"]
+    resultado = _build_local_smart_preview(meta)
+    if firma:
+        if len(SMART_PREVIEW_CACHE) > 4:
+            SMART_PREVIEW_CACHE.clear()
+        SMART_PREVIEW_CACHE[text_name] = {"firma": firma, "resultado": resultado}
+    return resultado
+
+
+def _build_local_smart_preview(meta):
+    analysis = meta.get("analisis") or {}
+    keywords_all = [k.get("palabra") for k in analysis.get("palabras_clave", [])[:5] if isinstance(k, dict) and k.get("palabra")]
+    # Una palabra con símbolos raros viene de texto cifrado y no aporta nada.
+    keywords = [k for k in keywords_all if re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9 .-]{2,30}", k)]
+    outline = [x.get("idea") for x in analysis.get("bosquejo", []) if isinstance(x, dict) and x.get("idea")]
+    summary = str(analysis.get("resumen") or "").strip()
+    fragments = smart_document_fragments(meta, "", 8)
+    legibles = [f for f in fragments if is_legible_text(f.get("fragmento", ""))]
+
+    # Las palabras clave guardadas vienen del análisis general, que en estos
+    # documentos quedó cifrado («caso, singular, kaiv»). Si ese análisis se omitió,
+    # el tema provisional se deriva de los fragmentos legibles ya seleccionados.
+    # El tema principal sale de la frecuencia entre páginas distintas, que es lo
+    # que dice de qué trata el libro (no de las notas de gramática).
+    tema = tema_principal(meta)
+    if tema:
+        keywords = tema
+    elif meta.get("analisis_general_omitido") or not keywords:
+        ocurrencias, paginas_de, original = {}, {}, {}
+        for f in legibles:
+            crudo = str(f.get("fragmento") or "")
+            for w in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", crudo):
+                n = normalize_search(w)
+                if n in FUNCTION_WORDS:
+                    continue
+                ocurrencias[n] = ocurrencias.get(n, 0) + 1
+                original.setdefault(n, w)
+            for n in set(normalize_search(w) for w in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", crudo)):
+                if n in FUNCTION_WORDS:
+                    continue
+                paginas_de[n] = paginas_de.get(n, 0) + 1
+        orden = sorted(ocurrencias, key=lambda w: (paginas_de.get(w, 0), ocurrencias[w], len(w)), reverse=True)
+        keywords = [original.get(w, w) for w in orden[:5]]
+    # El tema del libro no es "caso, verbo, singular": esos términos se descartan
+    # (salvo que no quede nada mejor).
+    utiles = [k for k in keywords if normalize_search(k) not in TERMINOS_TECNICOS]
+    keywords = utiles or keywords
+
+    # El resumen guardado solo sirve si el documento pasó el control de calidad.
+    central = ""
+    if not meta.get("analisis_general_omitido"):
+        for sentence in re.split(r"(?<=[.!?])\s+", summary):
+            if len(sentence.strip()) >= 60 and is_legible_text(sentence):
+                central = sentence.strip()[:700]
+                break
+    if not central and legibles:
+        # Se prefiere el fragmento que cita versículos: es el que comenta el texto bíblico.
+        best = max(legibles, key=lambda f: (len(BOOK_REF_RE.findall(f.get("fragmento", ""))), f.get("puntaje_local") or 0))
+        central = _first_sentences(best.get("fragmento"), 700)
+
+    # En libros grandes el bosquejo guardado son líneas de índice («Mensaje a la
+    # iglesia en Pérgamo (2:12-17) 169»), no ideas: se derivan de los fragmentos.
+    ideas = [] if meta.get("analisis_general_omitido") else \
+        [i for i in outline if len(i) >= 30 and is_legible_text(i)][:5]
+    if not ideas:
+        for f in legibles:
+            # Frase a frase: el fragmento puede ser legible y su primera línea griega no.
+            for sentence in _oraciones(f.get("fragmento", "")):
+                if len(sentence) < 40 or not is_legible_text(sentence):
+                    continue
+                idea = _first_sentences(sentence, 220)
+                if idea and idea not in ideas:
+                    ideas.append(idea)
+                break
+            if len(ideas) >= 3:
+                break
+
+    avisos = ["Preparación local completada. Ningún texto fue enviado a Internet."]
+    if not legibles:
+        avisos.append("⚠️ El texto interno de estas páginas está cifrado/ilegible: no se pudieron derivar resumen ni ideas.")
+    elif len(legibles) < len(fragments):
+        avisos.append(f"⚠️ {len(fragments) - len(legibles)} de {len(fragments)} fragmentos venían cifrados y se descartaron.")
+
+    return {
+        "modo": "local",
+        "ia_conectada": False,
+        "tema_principal_provisional": ", ".join(keywords[:3]) if keywords else "Por determinar con IA",
+        "punto_central_provisional": central or "No disponible: el texto de estas páginas está cifrado.",
+        "ideas_provisionales": ideas,
+        "referencias": analysis.get("referencias", [])[:20],
+        "fragmentos": fragments,
+        "calidad_extraccion": meta.get("calidad_extraccion", ""),
+        "aviso": " ".join(avisos)
+    }
+
+
+def _respuesta_local(fragments, question):
+    """Párrafo de respuesta armado localmente con las oraciones que responden."""
+    words = search_words(question, 3)
+    if not words:
+        return ""
+    oraciones = []
+    for f in fragments:
+        for s in _oraciones(f.get("fragmento", "")):
+            s = " ".join(s.split())
+            if len(s) < 45 or len(s) > 420 or not is_legible_text(s):
+                continue
+            oraciones.append(s)
+
+    def puntaje(s):
+        norm = normalize_search(s)
+        return sum(1 for w in words if w in norm)
+
+    elegidas, vistas, largo = [], set(), 0
+    for s in sorted(oraciones, key=puntaje, reverse=True):
+        if puntaje(s) <= 0:
+            break
+        clave = normalize_search(s)[:80]
+        if clave in vistas:
+            continue
+        vistas.add(clave)
+        elegidas.append(s)
+        largo += len(s)
+        if len(elegidas) >= 3 or largo > 750:
+            break
+    return " ".join(elegidas)
+
+
+def _preguntas_seguimiento(question, fragments, respuesta):
+    """Tres preguntas para seguir trabajando el tema, en lenguaje del usuario."""
+    genericas = {"ensena", "ensenar", "dice", "decir", "habla", "hablar", "menciona",
+                 "mencionar", "explica", "explicar", "significa", "quiere", "mostrar",
+                 "muestra", "autor", "documento", "texto", "libro", "pagina",
+                 "acerca", "respecto", "segun", "puede", "debe", "sabe"}
+    words = [w for w in search_words(question, 4) if len(w) >= 4]
+    hay = normalize_search((respuesta or "") + " " + " ".join(str(f.get("fragmento") or "") for f in fragments))
+    candidatos = [w for w in words if w in hay] or words
+    if not candidatos:
+        candidatos = [w for w in re.findall(r"[a-záéíóúüñ]{4,}", hay)][:1] or ["el texto"]
+
+    def cuenta(w):
+        return len(re.findall(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", hay))
+
+    # Lo más repetido en el documento es el tema de verdad; los verbos de la
+    # pregunta ("enseña", "dice") solo empañan las preguntas de seguimiento.
+    ordenados = sorted((w for w in candidatos if w not in genericas),
+                       key=lambda w: (-cuenta(w), -len(w))) or candidatos
+    tema_norm = ordenados[0]
+    original = None
+    for tok in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", question):
+        if normalize_search(tok) == tema_norm:
+            original = tok
+            break
+    tema = original or tema_norm.capitalize()
+    return [
+        f"¿Qué papel juega «{tema}» en el documento?",
+        f"¿Qué pasajes bíblicos apoyan lo que dice acerca de «{tema}»?",
+        f"¿Cómo aplicarías «{tema}» en la vida diaria?",
+    ]
+
+
+def build_local_question_preview(meta, question):
+    question = clean_text(str(question or ""))[:500]
+    if len(question) < 3:
+        raise ValueError("Escribe una pregunta sobre el documento")
+
+    result = search_document_topic(meta, question)
+    # Para una pregunta el orden útil es por relevancia (no por página).
+    fragments = sorted(result.get("fragmentos") or [],
+                       key=lambda x: float(x.get("puntaje") or x.get("puntaje_local") or 0),
+                       reverse=True)[:8]
+    descartados = int(result.get("descartados_cifrados") or 0)
+    coincidencias = int(result.get("coincidencias") or 0)
+    directas = int(result.get("coincidencias_directas") or 0)
+
+    if not fragments:
+        words = search_words(question, 4)
+        if words:
+            fragments = sorted(smart_document_fragments(meta, " ".join(words[:8]), 8),
+                               key=lambda x: float(x.get("puntaje_local") or 0), reverse=True)
+
+    if directas:
+        aviso = "Evidencia local encontrada. Estos fragmentos se enviarían a la IA cuando activemos la segunda etapa."
+    elif coincidencias:
+        aviso = "Solo coincidencias parciales: los fragmentos comparten parte de las palabras de tu pregunta."
+    elif fragments:
+        aviso = "No hubo coincidencias exactas con tu pregunta; estos son los fragmentos más relacionados del documento."
+    else:
+        aviso = "No se encontró evidencia legible para esta pregunta. Prueba con «Preparar análisis» o con otra parte del documento."
+    if descartados:
+        aviso += f" Se descartaron {descartados} fragmentos con texto ilegible."
+
+    respuesta = _respuesta_local(fragments, question)
+
+    return {
+        "modo": "local",
+        "ia_conectada": False,
+        "pregunta": question,
+        "coincidencias": coincidencias,
+        "directo": bool(directas),
+        "paginas": sorted(set(int(x.get("pagina", 0)) for x in fragments if x.get("pagina"))),
+        "fragmentos": fragments,
+        "aviso": aviso,
+        "respuesta_local": respuesta,
+        "seguimiento": _preguntas_seguimiento(question, fragments, respuesta)
+    }
+
+def save_meta(meta):
+    document_meta_path(meta["id"]).write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding="utf-8")
+
+
+def read_pdf_bibliography(pdf_path):
+    info = {}
+    if pdf_path and pdf_path.is_file():
+        result = subprocess.run(["pdfinfo", str(pdf_path)], capture_output=True, text=True, errors="replace")
+        for line in result.stdout.splitlines():
+            if ":" not in line: continue
+            key,value = line.split(":",1); info[key.strip().casefold()] = value.strip()
+    def integer(name):
+        match = re.search(r"\d+", info.get(name, "")); return int(match.group()) if match else 0
+    return {"titulo":info.get("title", ""),"autor":info.get("author", ""),"fecha_publicacion":info.get("creationdate", ""),"editorial":info.get("publisher", "") or info.get("producer", ""),"paginas":integer("pages")}
+
+def text_extraction_quality(text):
+    sample = (text or "")[:120000]
+    if len(sample.strip()) < 80: return "requiere_ocr"
+    visible = [ch for ch in sample if not ch.isspace()]
+    if not visible: return "requiere_ocr"
+    letters = sum(ch.isalpha() or ch.isdigit() for ch in visible)
+    suspicious = sum(ch in "@#$%^&*{}[]<>\\|~_" for ch in visible)
+    word_tokens = re.findall(r"\S+", sample)
+    normal_words = sum(bool(re.fullmatch(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9.,;:¿?¡!()'\"-]+", w)) for w in word_tokens[:15000])
+    ratio_letters = letters / len(visible)
+    ratio_words = normal_words / max(1, min(len(word_tokens),15000))
+    if ratio_letters < .62 or suspicious / len(visible) > .035 or ratio_words < .72: return "defectuoso"
+    return "legible"
+
+def classify_document_meta(meta):
+    pdf_name = meta.get("archivo"); txt_name = meta.get("texto")
+    pdf_path = DOCUMENTS / pdf_name if pdf_name else None
+    txt_path = DOCUMENTS / txt_name if txt_name else None
+    bibliography = meta.get("bibliografia") or {}
+    detected = read_pdf_bibliography(pdf_path)
+    for key,value in detected.items():
+        if not bibliography.get(key) and value: bibliography[key] = value
+    bibliography.setdefault("titulo", meta.get("nombre", ""))
+    bibliography.setdefault("autor", "")
+    bibliography.setdefault("fecha_publicacion", "")
+    bibliography.setdefault("editorial", "")
+    bibliography.setdefault("paginas", 0)
+    size = pdf_path.stat().st_size if pdf_path and pdf_path.is_file() else int(meta.get("tamano") or 0)
+    raw_text = txt_path.read_text(encoding="utf-8",errors="replace") if txt_path and txt_path.is_file() else ""
+    quality = "archivado" if meta.get("estado") == "archivado" else text_extraction_quality(raw_text)
+    # Las referencias se guardaban sin detectar abreviaturas (Is. 53:7, 1 P. 1:19);
+    # se completan una sola vez y quedan guardadas en la ficha.
+    analysis = meta.get("analisis") or {}
+    if raw_text and len(raw_text) > 200 and int(analysis.get("refs_v") or 0) < 2:
+        analysis["referencias"] = bible_references(raw_text)
+        analysis["refs_v"] = 2
+        meta["analisis"] = analysis
+    large = int(bibliography.get("paginas") or 0) > 200 or size > 15*1024*1024
+    meta["bibliografia"] = bibliography
+    meta["tamano"] = size if pdf_path and pdf_path.is_file() else 0
+    meta["tipo_documento"] = "grande" if large else "pequeno"
+    meta["calidad_extraccion"] = quality
+    if large:
+        meta["analisis_general_omitido"] = True
+    elif quality != "legible":
+        meta["analisis_general_omitido"] = True
+    else:
+        meta["analisis_general_omitido"] = False
+    return meta
+
+
+def recording_meta_path(audio_id):
+    return RECORDINGS / f"{audio_id}.json"
+
+def load_recording_meta(audio_id):
+    if not re.fullmatch(r"[a-f0-9]{12}", audio_id): raise ValueError("Grabación no encontrada")
+    path = recording_meta_path(audio_id)
+    if not path.is_file(): raise ValueError("Grabación no encontrada")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def save_recording(filename, content, title, mime):
+    if not content: raise ValueError("La grabación está vacía")
+    if len(content) > 200*1024*1024: raise ValueError("La grabación supera el límite de 200 MB")
+    audio_id = uuid.uuid4().hex[:12]
+    mime = (mime or "audio/webm").split(";",1)[0].strip().lower()
+    extension = {"audio/ogg":".ogg","audio/mp4":".m4a","audio/mpeg":".mp3","audio/wav":".wav"}.get(mime,".webm")
+    audio_path = RECORDINGS / f"{audio_id}{extension}"
+    audio_path.write_bytes(content)
+    meta = {"id":audio_id,"titulo":clean_text(title)[:250] or "Nueva reflexión","archivo":audio_path.name,"mime":mime,"tamano":len(content),"creado":datetime_now(),"duracion":None}
+    recording_meta_path(audio_id).write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding="utf-8")
+    return meta
+
+class Handler(SimpleHTTPRequestHandler):
+    def translate_path(self, path):
+        raw_path = urlparse(path).path
+        if raw_path in ('', '/'):
+            clean = 'index.html'
+        else:
+            clean = raw_path.lstrip('/')
+        static_root = STATIC.resolve()
+        candidate = (static_root / clean).resolve()
+        try:
+            candidate.relative_to(static_root)
+        except ValueError:
+            return str(static_root / '__not_found__')
+        return str(candidate)
+
+    def send_json(self, value, status=200):
+        payload = json.dumps(value, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b'{}')
+
+    def is_trusted_local_request(self):
+        """Allow state-changing requests only from this local app.
+
+        A random website can try to submit forms or fetch requests to
+        http://127.0.0.1:8765. Modern browsers include Origin/Referer on
+        those unsafe requests, so we reject anything that does not point back
+        to this local server. Missing headers are allowed for local tools such
+        as curl or maintenance scripts.
+        """
+        allowed_hosts = {"127.0.0.1", "localhost"}
+        allowed_port = PORT
+
+        def valid(value):
+            if not value:
+                return None
+            parsed = urlparse(value)
+            return parsed.scheme in {"http", "https"} and parsed.hostname in allowed_hosts and (parsed.port or (443 if parsed.scheme == "https" else 80)) == allowed_port
+
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        if origin:
+            return valid(origin)
+        if referer:
+            return valid(referer)
+        return True
+
+    def reject_untrusted_local_request(self):
+        if self.is_trusted_local_request():
+            return False
+        self.send_json({"error":"Solicitud bloqueada: origen no autorizado"}, 403)
+        return True
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        try:
+            # OBS_CONTROL_V1 GET
+            if u.path == "/api/obs/estado":
+                return self.send_json(obs_control.estado())
+            # GOOGLE_DRIVE_SYNC_V1 GET
+            if u.path == "/api/sync/status":
+                script = ROOT / "sync" / "sincronizador_drive_v1.py"
+                result = subprocess.run(
+                    ["python", str(script), "estado"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                if "🟢 Sincronizado" in output:
+                    estado = "sincronizado"
+                elif "🟡 Hay cambios locales" in output:
+                    estado = "subir"
+                elif "🔵 Hay cambios en Google Drive" in output:
+                    estado = "descargar"
+                elif "CONFLICTO" in output:
+                    estado = "conflicto"
+                else:
+                    estado = "error"
+                return self.send_json({
+                    "ok": result.returncode in (0, 3, 4),
+                    "estado": estado,
+                    "salida": output.strip()
+                })
+
+            # CONCENTRACION_REPORTES_V1 GET
+            if u.path == "/api/automation-settings": return self.send_json(automation_settings())
+            if u.path == "/api/focus/sessions":
+                with db() as con: rows=con.execute("SELECT * FROM sesiones_concentracion ORDER BY creado DESC LIMIT 20").fetchall()
+                return self.send_json([dict(row) for row in rows])
+            if u.path == "/api/plan-state": return self.send_json(plan_rows())
+            if u.path == "/api/reports/preview":
+                kind=q.get("kind",["monthly"])[0]
+                return self.send_json(build_report("weekly" if kind=="weekly" else "monthly"))
+            if u.path == "/api/books":
+                version = q.get("version", ["rvr1960"])[0]
+                if version not in BIBLE_VERSIONS: raise ValueError("Versión bíblica desconocida")
+                return self.send_json([{"id": key, "nombre": name, "capitulos": len(load_book(key,version))} for key,name in BOOKS])
+            if u.path == "/api/chapter":
+                book = q.get("book", ["genesis"])[0]
+                version = q.get("version", ["rvr1960"])[0]
+                chapter = int(q.get("chapter", ["1"])[0])
+                chapters = load_book(book, version)
+                if chapter < 1 or chapter > len(chapters): raise ValueError("Capítulo inválido")
+                info = BIBLE_VERSIONS[version]
+                return self.send_json({"libro": BOOK_NAMES[book], "capitulo": chapter, "versiculos": chapters[chapter-1], "version":version, "version_nombre":info["nombre"], "abreviatura":info["abreviatura"]})
+            if u.path == "/api/search":
+                term = q.get("q", [""])[0].strip().casefold()
+                requested = q.get("version", ["rvr1960"])[0]
+                versions = list(BIBLE_VERSIONS) if requested == "ambas" else [requested]
+                if any(version not in BIBLE_VERSIONS for version in versions): raise ValueError("Versión bíblica desconocida")
+                results = []
+                if len(term) >= 2:
+                    for version in versions:
+                        for key,name in BOOKS:
+                            for ci, chapter in enumerate(load_book(key,version), 1):
+                                for vi, verse in enumerate(chapter, 1):
+                                    if term in verse.casefold():
+                                        results.append({"libro_id":key,"libro":name,"capitulo":ci,"versiculo":vi,"texto":verse,"version":version,"abreviatura":BIBLE_VERSIONS[version]["abreviatura"]})
+                                        if len(results) >= 100: return self.send_json(results)
+                return self.send_json(results)
+            if u.path == "/api/dashboard":
+                return self.send_json(dashboard_data())
+            if u.path == "/api/highlights":
+                where = []; values = []
+                for query_name, column in (("version","version"),("book","libro"),("chapter","capitulo"),("verse","versiculo"),("color","color")):
+                    if query_name in q and q[query_name][0] != "":
+                        where.append(column + "=?"); values.append(q[query_name][0])
+                sql = "SELECT * FROM resaltados_biblicos"
+                if where: sql += " WHERE " + " AND ".join(where)
+                sql += " ORDER BY actualizado DESC,id DESC"
+                with db() as con: rows = con.execute(sql, values).fetchall()
+                return self.send_json([dict(row) for row in rows])
+            if u.path == "/api/presentations":
+                with db() as con:
+                    rows = con.execute("SELECT * FROM presentaciones ORDER BY actualizado DESC").fetchall()
+                return self.send_json([presentation_dict(row) for row in rows])
+            presentation_match = re.fullmatch(r"/api/presentations/(\d+)", u.path)
+            if presentation_match:
+                with db() as con:
+                    row = con.execute("SELECT * FROM presentaciones WHERE id=?", (int(presentation_match.group(1)),)).fetchone()
+                if not row: raise ValueError("Presentación no encontrada")
+                return self.send_json(presentation_dict(row))
+            if u.path == "/api/messages":
+                with db() as con:
+                    rows = con.execute("SELECT * FROM mensajes ORDER BY actualizado DESC").fetchall()
+                return self.send_json([dict(r) for r in rows])
+            if u.path == "/api/reminders":
+                with db() as con: rows = con.execute("SELECT * FROM recordatorios ORDER BY hora,id").fetchall()
+                return self.send_json([dict(r) for r in rows])
+            if u.path == "/api/email-config":
+                config = load_email_config(False)
+                return self.send_json({"provider":"gmail","sender":config.get("sender", ""),"recipient":config.get("recipient", ""),"configured":bool(config.get("sender"))})
+            if u.path == "/api/recordings":
+                rows = []
+                for path in RECORDINGS.glob("*.json"):
+                    try: rows.append(json.loads(path.read_text(encoding="utf-8")))
+                    except Exception: pass
+                rows.sort(key=lambda x:x.get("creado") or "", reverse=True)
+                return self.send_json(rows)
+            audio_match = re.fullmatch(r"/api/recordings/([a-f0-9]{12})/audio", u.path)
+            if audio_match:
+                meta = load_recording_meta(audio_match.group(1)); path = RECORDINGS / meta["archivo"]
+                payload = path.read_bytes(); self.send_response(200); self.send_header("Content-Type",meta.get("mime") or "audio/webm"); self.send_header("Content-Length",str(len(payload))); self.send_header("Accept-Ranges","bytes"); self.end_headers(); self.wfile.write(payload); return
+            if u.path == "/api/documents":
+                rows = []
+                for path in DOCUMENTS.glob("*.json"):
+                    try:
+                        item = json.loads(path.read_text(encoding="utf-8"))
+                        if item.get("archivo") and (DOCUMENTS / item["archivo"]).is_file():
+                            item["tamano"] = (DOCUMENTS / item["archivo"]).stat().st_size
+                        rows.append({k:item.get(k) for k in ("id","nombre","estado","creado","tamano","archivo")})
+                    except Exception: pass
+                rows.sort(key=lambda x:x.get("creado") or "", reverse=True)
+                return self.send_json(rows)
+            match_doc = re.fullmatch(r"/api/documents/([a-f0-9]{12})", u.path)
+            if match_doc:
+                return self.send_json(load_document_meta(match_doc.group(1)))
+            match_pdf = re.fullmatch(r"/api/documents/([a-f0-9]{12})/pdf", u.path)
+            if match_pdf:
+                # VISOR_PDF_RANGOS_V1: rangos HTTP (206) para que PDF.js pida solo
+                # los trozos que necesita en vez del archivo completo. Sin Range se
+                # sirve entero (200) como antes. Se transmite por tramos desde disco
+                # para no cargar PDFs grandes completos en memoria.
+                meta = load_document_meta(match_pdf.group(1))
+                path = DOCUMENTS / meta["archivo"]
+                size = path.stat().st_size
+                start, end = 0, size - 1
+                parcial = False
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    try:
+                        spec = rng.split("=", 1)[1].split(",")[0].strip()
+                        a, _, b = spec.partition("-")
+                        if a:
+                            start = int(a)
+                            end = int(b) if b else size - 1
+                            if start >= size:
+                                raise ValueError
+                            end = min(end, size - 1)
+                        elif b:
+                            start = max(0, size - int(b))
+                            end = size - 1
+                        else:
+                            raise ValueError
+                        if start > end:
+                            raise ValueError
+                        parcial = True
+                    except ValueError:
+                        start, end = 0, size - 1
+                        parcial = False
+                length = end - start + 1
+                self.send_response(206 if parcial else 200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Accept-Ranges", "bytes")
+                if parcial:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Disposition", f'inline; filename="{meta["nombre"]}"')
+                self.end_headers()
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    restante = length
+                    while restante > 0:
+                        trozo = f.read(min(65536, restante))
+                        if not trozo:
+                            break
+                        self.wfile.write(trozo)
+                        restante -= len(trozo)
+                return
+            return super().do_GET()
+        except Exception as exc:
+            return self.send_json({"error": str(exc)}, 400)
+
+    def do_POST(self):
+        if self.reject_untrusted_local_request():
+            return
+        try:
+            current_path = urlparse(self.path).path
+            # GOOGLE_DRIVE_SYNC_V1 POST
+            if current_path == "/api/sync/run":
+                script = ROOT / "sync" / "sincronizador_drive_v1.py"
+
+                check = subprocess.run(
+                    ["python", str(script), "estado"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+
+                salida_estado = (check.stdout or "") + (check.stderr or "")
+
+                if "🟢 Sincronizado" in salida_estado:
+                    return self.send_json({
+                        "ok": True,
+                        "estado": "sincronizado",
+                        "salida": salida_estado.strip()
+                    })
+
+                if "🔵 Hay cambios en Google Drive" in salida_estado:
+                    return self.send_json({
+                        "ok": False,
+                        "estado": "descargar",
+                        "salida": salida_estado.strip(),
+                        "mensaje": "Hay una versión más nueva en Google Drive. No se descargará automáticamente."
+                    }, 409)
+
+                if "CONFLICTO" in salida_estado:
+                    return self.send_json({
+                        "ok": False,
+                        "estado": "conflicto",
+                        "salida": salida_estado.strip(),
+                        "mensaje": "Hay cambios en ambos equipos. No se sobrescribirá nada."
+                    }, 409)
+
+                if "🟡 Hay cambios locales" not in salida_estado:
+                    return self.send_json({
+                        "ok": False,
+                        "estado": "error",
+                        "salida": salida_estado.strip()
+                    }, 500)
+
+                result = subprocess.run(
+                    ["python", str(script), "subir"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+
+                output = (result.stdout or "") + (result.stderr or "")
+
+                return self.send_json({
+                    "ok": result.returncode == 0,
+                    "estado": "sincronizado" if result.returncode == 0 else "error",
+                    "salida": output.strip()
+                }, 200 if result.returncode == 0 else 500)
+
+            # CONCENTRACION_REPORTES_V1 POST
+            if current_path == "/api/plan-state":
+                data=self.read_json(); mode=str(data.get("modo",""))
+                if mode not in ("cronologico","testamentos"): raise ValueError("Plan no válido")
+                completed=data.get("completed") or {}; notes=data.get("notes") or {}
+                if not isinstance(completed,dict) or not isinstance(notes,dict): raise ValueError("Progreso no válido")
+                current=max(1,min(365,int(data.get("dia_actual",1)))); total=max(0,int(data.get("total",0)))
+                done=len(completed); today_done=sum(1 for key in completed if str(key).startswith(str(current)+":"))
+                day_numbers=[]
+                for key in completed:
+                    try: day_numbers.append(int(str(key).split(":",1)[0]))
+                    except Exception: pass
+                last=max(day_numbers or [0]); today_total=max(0,int(data.get("hoy_total",0)))
+                payload={"completed":completed,"notes":notes}
+                pendientes=[str(x)[:160] for x in (data.get("pendientes") or []) if isinstance(x,str)][:25]
+                payload["pendientes"]=pendientes
+                payload["pendientes_total"]=int(data.get("pendientes_total") or 0)
+                with db() as con:
+                    previo={}
+                    try:
+                        fila=con.execute("SELECT datos FROM estados_plan WHERE modo=?",(mode,)).fetchone()
+                        previo=json.loads(fila[0]) if fila and fila[0] else {}
+                    except Exception:
+                        previo={}
+                    horario=data.get("horario")
+                    if not isinstance(horario,dict) or not horario:
+                        # El horario sólo viene al abrir; si no vino, conservamos el anterior.
+                        horario=previo.get("horario")
+                    if isinstance(horario,dict) and horario: payload["horario"]=horario
+                    # Hora en que se marcó cada lectura (calendario).
+                    stamps=data.get("stamps")
+                    if not isinstance(stamps,dict): stamps=previo.get("stamps")
+                    if isinstance(stamps,dict):
+                        payload["stamps"]={str(k)[:120]:str(v)[:32] for k,v in list(stamps.items())[:2000]}
+                    con.execute("""INSERT INTO estados_plan(modo,inicio,dia_actual,completadas,total,dias_atraso,hoy_completadas,hoy_total,ultimo_dia_completado,reflexiones,datos,actualizado)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime')) ON CONFLICT(modo) DO UPDATE SET inicio=excluded.inicio,dia_actual=excluded.dia_actual,
+                        completadas=excluded.completadas,total=excluded.total,dias_atraso=excluded.dias_atraso,hoy_completadas=excluded.hoy_completadas,hoy_total=excluded.hoy_total,
+                        ultimo_dia_completado=excluded.ultimo_dia_completado,reflexiones=excluded.reflexiones,datos=excluded.datos,actualizado=datetime('now','localtime')""",
+                        (mode,str(data.get("inicio",""))[:10],current,done,total,max(0,min(365,int(data.get("dias_atraso",0)))),today_done,today_total,last,len([x for x in notes.values() if str(x).strip()]),json.dumps(payload,ensure_ascii=False)))
+                return self.send_json({"ok":True})
+            if current_path == "/api/focus/sessions":
+                data=self.read_json(); kind=str(data.get("tipo","estudio"))[:50]
+                planned=max(1,min(240,int(data.get("minutos_planeados",25)))); seconds=max(0,min(86400,int(data.get("segundos_realizados",0))))
+                with db() as con:
+                    cur=con.execute("INSERT INTO sesiones_concentracion(tipo,proposito,notas,minutos_planeados,segundos_realizados,completada,creado) VALUES(?,?,?,?,?,?,datetime('now','localtime'))",
+                        (kind,str(data.get("proposito",""))[:1000],str(data.get("notas",""))[:10000],planned,seconds,1 if data.get("completada") else 0))
+                return self.send_json({"ok":True,"id":cur.lastrowid},201)
+            if current_path == "/api/automation-settings": return self.send_json(save_automation_settings(self.read_json()))
+            if current_path == "/api/reports/send":
+                data=self.read_json(); kind="weekly" if data.get("kind")=="weekly" else "monthly"; report=build_report(kind)
+                destination=send_gmail(("Resumen semanal" if kind=="weekly" else "Informe mensual")+" — Mi Estudio Bíblico",report["texto"],automation_settings().get("recipient",""))
+                return self.send_json({"ok":True,"destination":destination})
+            from_message_match = re.fullmatch(r"/api/presentations/from-message/(\d+)", current_path)
+            if from_message_match:
+                message_id = int(from_message_match.group(1))
+                with db() as con:
+                    message = con.execute("SELECT * FROM mensajes WHERE id=?", (message_id,)).fetchone()
+                    if not message: raise ValueError("Mensaje no encontrado")
+                    existing = con.execute("SELECT id FROM presentaciones WHERE mensaje_id=?", (message_id,)).fetchone()
+                    if existing: return self.send_json({"ok":True,"id":existing["id"],"existing":True})
+                    cur = con.execute("""INSERT INTO presentaciones
+                        (mensaje_id,titulo,texto_base,notas_privadas,actualizado)
+                        VALUES(?,?,?,?,datetime('now','localtime'))""",
+                        (message_id,message["titulo"],message["texto_base"],message["contenido"]))
+                return self.send_json({"ok":True,"id":cur.lastrowid},201)
+            if current_path == "/api/highlights":
+                data = self.read_json()
+                version,book,chapter,verse,start,end,selected,color = validate_highlight(data)
+                note = str(data.get("nota", "")).strip()[:5000]
+                with db() as con:
+                    overlap = con.execute("""SELECT id FROM resaltados_biblicos WHERE version=? AND libro=? AND capitulo=? AND versiculo=?
+                        AND NOT(fin<=? OR inicio>=?) LIMIT 1""", (version,book,chapter,verse,start,end)).fetchone()
+                    if overlap: raise ValueError("Ese texto ya está resaltado. Primero elimina o modifica la marca existente.")
+                    cur = con.execute("""INSERT INTO resaltados_biblicos
+                        (version,libro,capitulo,versiculo,inicio,fin,texto,color,nota,creado,actualizado)
+                        VALUES(?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))""",
+                        (version,book,chapter,verse,start,end,selected,color,note))
+                return self.send_json({"ok":True,"id":cur.lastrowid},201)
+            if current_path == "/api/presentations":
+                data = self.read_json(); values = presentation_values(data)
+                with db() as con:
+                    cur = con.execute("""INSERT INTO presentaciones
+                        (titulo,texto_base,idea_central,introduccion,puntos,versiculos,aplicacion,titulo_aplicacion,conclusion,notas_privadas,actualizado)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))""", values)
+                return self.send_json({"ok":True,"id":cur.lastrowid},201)
+            if current_path == "/api/activity/visit":
+                today = local_today()
+                with db() as con:
+                    con.execute("""INSERT INTO uso_programa(fecha,aperturas,primera_apertura,ultima_apertura) VALUES(?,1,datetime('now','localtime'),datetime('now','localtime'))
+                        ON CONFLICT(fecha) DO UPDATE SET aperturas=aperturas+1,ultima_apertura=datetime('now','localtime')""",(today,))
+                return self.send_json({"ok":True})
+            if current_path == "/api/activity/reading":
+                data = self.read_json(); book = str(data.get("book", "")); version = str(data.get("version", "rvr1960")); chapter = int(data.get("chapter", 0))
+                if book not in BOOK_NAMES or chapter < 1: raise ValueError("Lectura no válida")
+                with db() as con:
+                    con.execute("INSERT OR IGNORE INTO lecturas_consultadas(fecha,version,libro,capitulo,consultado) VALUES(?,?,?,?,datetime('now','localtime'))",(local_today(),version,book,chapter))
+                return self.send_json({"ok":True})
+            if current_path == "/api/mood":
+                data = self.read_json(); mood = str(data.get("estado", "")); note = str(data.get("nota", "")).strip()[:2000]
+                allowed = {"muy_bien","bien","paz","triste","preocupado","fortaleza"}
+                if mood not in allowed: raise ValueError("Selecciona cómo te sientes")
+                with db() as con:
+                    con.execute("""INSERT INTO estados_animo(fecha,estado,nota,actualizado) VALUES(?,?,?,datetime('now','localtime'))
+                        ON CONFLICT(fecha) DO UPDATE SET estado=excluded.estado,nota=excluded.nota,actualizado=datetime('now','localtime')""",(local_today(),mood,note))
+                return self.send_json({"ok":True})
+            notified_match = re.fullmatch(r"/api/reminders/(\d+)/notified", current_path)
+            if notified_match:
+                data = self.read_json()
+                with db() as con: con.execute("UPDATE recordatorios SET ultimo_aviso=? WHERE id=?",(str(data.get("fecha", "")),int(notified_match.group(1))))
+                return self.send_json({"ok":True})
+            if current_path == "/api/email-config":
+                return self.send_json(save_email_config(self.read_json()))
+            if current_path == "/api/email-test":
+                data = self.read_json(); destination = send_gmail("Prueba de Mi Estudio Bíblico", "¡La conexión con Gmail funciona correctamente!\\n\\nDesde ahora podrás recibir tus recordatorios bíblicos por correo.", data.get("recipient", ""))
+                return self.send_json({"ok":True,"destination":destination})
+            if current_path == "/api/reminders":
+                data = self.read_json(); title = str(data.get("titulo", "")).strip(); hour = str(data.get("hora", ""))
+                if not title: raise ValueError("Escribe un título")
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", hour): raise ValueError("Hora no válida")
+                send_email = 1 if data.get("enviar_correo") else 0
+                destination = str(data.get("correo_destino", "")).strip()[:320]
+                if send_email and not load_email_config(False).get("configured") and not load_email_config(False).get("sender"): raise ValueError("Configura primero tu cuenta Gmail")
+                with db() as con:
+                    cur = con.execute("INSERT INTO recordatorios(titulo,contenido,hora,dias,activo,enviar_correo,correo_destino) VALUES(?,?,?,?,?,?,?)",(title[:250],str(data.get("contenido", ""))[:3000],hour,str(data.get("dias", "todos"))[:100],1 if data.get("activo",True) else 0,send_email,destination))
+                return self.send_json({"ok":True,"id":cur.lastrowid},201)
+            if current_path == "/api/recordings":
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 201*1024*1024: raise ValueError("Tamaño de grabación no permitido")
+                content_type = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in content_type: raise ValueError("Formato de grabación no válido")
+                body = self.rfile.read(length)
+                message = BytesParser(policy=email_policy).parsebytes((f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode()+body)
+                audio_part = next((p for p in message.iter_parts() if p.get_param("name",header="content-disposition")=="audio"),None)
+                title_part = next((p for p in message.iter_parts() if p.get_param("name",header="content-disposition")=="titulo"),None)
+                if audio_part is None: raise ValueError("No se recibió la grabación")
+                title = title_part.get_content() if title_part is not None else "Nueva reflexión"
+                meta = save_recording(audio_part.get_filename() or "grabacion.webm",audio_part.get_payload(decode=True) or b"",title,audio_part.get_content_type())
+                return self.send_json(meta,201)
+            # BIBLIOTECA_INTELIGENTE_LOCAL_V1 endpoints
+            smart_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/smart-preview", current_path)
+            if smart_match:
+                meta = load_document_meta(smart_match.group(1))
+                return self.send_json(build_local_smart_preview(meta))
+
+            smart_question_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/smart-question-preview", current_path)
+            if smart_question_match:
+                data = self.read_json(); meta = load_document_meta(smart_question_match.group(1))
+                return self.send_json(build_local_question_preview(meta, data.get("pregunta", "")))
+
+            topic_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/topic", current_path)
+            if topic_match:
+                data = self.read_json(); meta = load_document_meta(topic_match.group(1))
+                return self.send_json(search_document_topic(meta, data.get("tema", "")))
+            card_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/cards", current_path)
+            if card_match:
+                data = self.read_json(); meta = load_document_meta(card_match.group(1))
+                card = data.get("ficha") or {}
+                if not card.get("tema"): raise ValueError("Ficha temática no válida")
+                card["id"] = uuid.uuid4().hex[:10]; card["guardada"] = datetime_now()
+                meta.setdefault("fichas", []).append(card); save_meta(meta)
+                return self.send_json({"ok":True,"ficha":card}, 201)
+            if current_path == "/api/documents":
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 151 * 1024 * 1024: raise ValueError("Tamaño de archivo no permitido")
+                content_type = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in content_type: raise ValueError("Formato de carga no válido")
+                body = self.rfile.read(length)
+                message = BytesParser(policy=email_policy).parsebytes((f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode() + body)
+                part = next((p for p in message.iter_parts() if p.get_param("name", header="content-disposition") == "archivo"), None)
+                if part is None: raise ValueError("No se recibió el archivo")
+                meta = save_uploaded_pdf(part.get_filename() or "documento.pdf", part.get_payload(decode=True) or b"")
+                return self.send_json(meta, 201)
+            export_match = re.fullmatch(r"/api/messages/from-presentation/(\d+)", urlparse(self.path).path)
+            if export_match:
+                # EXPORTAR_PRESENTACION_A_MENSAJE_V1: vuelca contenido + notas privadas al mensaje
+                presentation_id = int(export_match.group(1))
+                with db() as con:
+                    row = con.execute("SELECT * FROM presentaciones WHERE id=?", (presentation_id,)).fetchone()
+                if not row: return self.send_json({"error":"Presentación no encontrada"}, 404)
+                p = dict(row)
+                data = self.read_json()
+                titulo = clean_text(data.get("titulo") or p.get("titulo") or "Mensaje sin título")[:300]
+                texto_base = clean_text(data.get("texto_base", p.get("texto_base", "")))[:1000]
+                contenido = str(data.get("contenido", ""))[:200000]
+                tipo = clean_text(data.get("tipo") or "Estudio")[:50] or "Estudio"
+                linked = p.get("mensaje_id")
+                with db() as con:
+                    if linked:
+                        con.execute("UPDATE mensajes SET titulo=?,texto_base=?,tipo=?,contenido=?,actualizado=datetime('now','localtime') WHERE id=?",
+                            (titulo, texto_base, tipo, contenido, int(linked)))
+                        message_id = int(linked)
+                        creado = False
+                    else:
+                        cur = con.execute("INSERT INTO mensajes(titulo,texto_base,tipo,contenido,actualizado) VALUES(?,?,?,?,datetime('now','localtime'))",
+                            (titulo, texto_base, tipo, contenido))
+                        message_id = cur.lastrowid
+                        creado = True
+                    con.execute("UPDATE presentaciones SET mensaje_id=? WHERE id=?", (message_id, presentation_id))
+                return self.send_json({"ok": True, "id": message_id, "creado": creado, "vinculado": True}, 201)
+            # OBS_CONTROL_V1 POST: acciones del predicador sobre OBS
+            if urlparse(self.path).path.startswith("/api/obs/"):
+                d = self.read_json()
+                ruta = urlparse(self.path).path
+                try:
+                    if ruta == "/api/obs/escena":
+                        return self.send_json(obs_control.cambiar_escena(d.get("escena")))
+                    if ruta == "/api/obs/transmision":
+                        accion, estado = obs_control.transmision(d.get("accion"))
+                        return self.send_json(dict({"ok": True, "accion": accion}, **estado))
+                    if ruta == "/api/obs/grabacion":
+                        accion, estado = obs_control.grabacion(d.get("accion"))
+                        return self.send_json(dict({"ok": True, "accion": accion}, **estado))
+                except obs_control.ObsNoDisponible as exc:
+                    return self.send_json({"ok": False, "conectado": False, "error": str(exc)})
+                return self.send_json({"error":"Ruta no encontrada"},404)
+            if urlparse(self.path).path == "/api/messages":
+                d = self.read_json()
+                with db() as con:
+                    cur = con.execute("INSERT INTO mensajes(titulo,texto_base,tipo,contenido,actualizado) VALUES(?,?,?,?,datetime('now','localtime'))",
+                        (d.get("titulo") or "Mensaje sin título", d.get("texto_base", ""), d.get("tipo", "Borrador"), d.get("contenido", "")))
+                return self.send_json({"ok": True, "id": cur.lastrowid}, 201)
+            return self.send_json({"error":"Ruta no encontrada"},404)
+        except Exception as exc:
+            return self.send_json({"error":str(exc)},400)
+
+    def do_DELETE(self):
+        if self.reject_untrusted_local_request():
+            return
+        try:
+            u = urlparse(self.path)
+            # ELIMINAR_MENSAJES_ORDEN_PLAN_V1
+            message_match = re.fullmatch(r"/api/messages/(\d+)", u.path)
+            if message_match:
+                message_id = int(message_match.group(1))
+                with db() as con:
+                    linked = con.execute("SELECT COUNT(*) FROM presentaciones WHERE mensaje_id=?", (message_id,)).fetchone()[0]
+                    result = con.execute("DELETE FROM mensajes WHERE id=?", (message_id,))
+                if not result.rowcount: return self.send_json({"error":"Mensaje no encontrado"},404)
+                return self.send_json({"ok":True,"presentaciones_conservadas":linked})
+            highlight_match = re.fullmatch(r"/api/highlights/(\d+)", u.path)
+            if highlight_match:
+                with db() as con: con.execute("DELETE FROM resaltados_biblicos WHERE id=?", (int(highlight_match.group(1)),))
+                return self.send_json({"ok":True})
+            archive_copy_match = re.fullmatch(r"/api/messages/archive-copy/(\d+)", u.path)
+            if archive_copy_match:
+                # BORRAR_COPIA_ARCHIVO_V1: nunca permite borrar una predicacion original
+                copy_id = int(archive_copy_match.group(1))
+                with db() as con:
+                    row = con.execute("SELECT titulo FROM presentaciones WHERE id=?", (copy_id,)).fetchone()
+                if not row: return self.send_json({"error":"Copia no encontrada"}, 404)
+                if ARCHIVE_COPY_MARKER not in str(row[0] or ""):
+                    return self.send_json({"error":"Solo se pueden borrar copias del archivo, no predicaciones originales."}, 403)
+                with db() as con: con.execute("DELETE FROM presentaciones WHERE id=?", (copy_id,))
+                return self.send_json({"ok":True,"eliminada":copy_id})
+            presentation_match = re.fullmatch(r"/api/presentations/(\d+)", u.path)
+            if presentation_match:
+                with db() as con: con.execute("DELETE FROM presentaciones WHERE id=?", (int(presentation_match.group(1)),))
+                return self.send_json({"ok":True})
+            reminder_match = re.fullmatch(r"/api/reminders/(\d+)", u.path)
+            if reminder_match:
+                with db() as con: con.execute("DELETE FROM recordatorios WHERE id=?",(int(reminder_match.group(1)),))
+                return self.send_json({"ok":True})
+            audio_match = re.fullmatch(r"/api/recordings/([a-f0-9]{12})", u.path)
+            if audio_match:
+                audio_id = audio_match.group(1); meta = load_recording_meta(audio_id); path = RECORDINGS / meta["archivo"]
+                if path.is_file(): path.unlink()
+                recording_meta_path(audio_id).unlink(missing_ok=True)
+                return self.send_json({"ok":True})
+            match = re.fullmatch(r"/api/documents/([a-f0-9]{12})", u.path)
+            if not match: return self.send_json({"error":"Ruta no encontrada"},404)
+            doc_id = match.group(1); meta = load_document_meta(doc_id); mode = parse_qs(u.query).get("mode", ["all"])[0]
+            for field in (("archivo","texto") if mode == "archive" else ("archivo","texto")):
+                name = meta.get(field)
+                if name:
+                    path = DOCUMENTS / name
+                    if path.is_file(): path.unlink()
+                meta[field] = None
+            if mode == "archive":
+                meta["estado"] = "archivado"; meta["tamano"] = 0; save_meta(meta)
+                return self.send_json({"ok":True,"modo":"archivado"})
+            document_meta_path(doc_id).unlink(missing_ok=True)
+            return self.send_json({"ok":True,"modo":"eliminado"})
+        except Exception as exc:
+            return self.send_json({"error":str(exc)},400)
+
+    def do_PUT(self):
+        if self.reject_untrusted_local_request():
+            return
+        try:
+            current_path = urlparse(self.path).path
+            highlight_match = re.fullmatch(r"/api/highlights/(\d+)", current_path)
+            if highlight_match:
+                data = self.read_json(); fields = []; values = []
+                if "color" in data:
+                    color = str(data.get("color", ""))
+                    if color not in HIGHLIGHT_COLORS: raise ValueError("Color inválido")
+                    fields.append("color=?"); values.append(color)
+                if "nota" in data:
+                    fields.append("nota=?"); values.append(str(data.get("nota", ""))[:5000])
+                if fields:
+                    values.append(int(highlight_match.group(1)))
+                    with db() as con: con.execute("UPDATE resaltados_biblicos SET "+",".join(fields)+",actualizado=datetime('now','localtime') WHERE id=?", values)
+                return self.send_json({"ok":True})
+            presentation_match = re.fullmatch(r"/api/presentations/(\d+)", current_path)
+            if presentation_match:
+                data = self.read_json(); target = int(presentation_match.group(1)); values = presentation_values(data) + (target,)
+                with db() as con:
+                    cur = con.execute("""UPDATE presentaciones SET titulo=?,texto_base=?,idea_central=?,introduccion=?,puntos=?,
+                        versiculos=?,aplicacion=?,titulo_aplicacion=?,conclusion=?,notas_privadas=?,actualizado=datetime('now','localtime') WHERE id=?""", values)
+                    # PUT_404_PRESENTACIONES: si la fila no existe, avisar en vez de responder 200
+                    if cur.rowcount < 1:
+                        return self.send_json({"error":"Predicación no encontrada"}, 404)
+                return self.send_json({"ok":True})
+            reminder_match = re.fullmatch(r"/api/reminders/(\d+)", current_path)
+            if reminder_match:
+                data = self.read_json(); fields=[]; values=[]
+                for key,column in (("titulo","titulo"),("contenido","contenido"),("hora","hora"),("dias","dias"),("activo","activo"),("enviar_correo","enviar_correo"),("correo_destino","correo_destino")):
+                    if key in data:
+                        fields.append(column+"=?"); values.append(1 if key=="activo" and data[key] else 0 if key=="activo" else str(data[key]))
+                if fields:
+                    values.append(int(reminder_match.group(1)))
+                    with db() as con: con.execute("UPDATE recordatorios SET "+",".join(fields)+" WHERE id=?",values)
+                return self.send_json({"ok":True})
+            metadata_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/metadata", current_path)
+            if metadata_match:
+                data = self.read_json(); meta = load_document_meta(metadata_match.group(1)); bibliography = meta.setdefault("bibliografia", {})
+                for key in ("titulo","autor","fecha_publicacion","editorial"):
+                    bibliography[key] = str(data.get(key, bibliography.get(key, "")))[:500]
+                save_meta(meta); return self.send_json({"ok":True,"bibliografia":bibliography})
+            notes_match = re.fullmatch(r"/api/documents/([a-f0-9]{12})/notes", current_path)
+            if notes_match:
+                data = self.read_json(); meta = load_document_meta(notes_match.group(1))
+                meta["notas"] = str(data.get("notas", ""))[:20000]; save_meta(meta)
+                return self.send_json({"ok":True})
+            match = re.fullmatch(r"/api/messages/(\d+)", current_path)
+            if not match: return self.send_json({"error":"Ruta no encontrada"},404)
+            d = self.read_json()
+            with db() as con:
+                con.execute("UPDATE mensajes SET titulo=?,texto_base=?,tipo=?,contenido=?,actualizado=datetime('now','localtime') WHERE id=?",
+                    (d.get("titulo") or "Mensaje sin título", d.get("texto_base", ""), d.get("tipo", "Borrador"), d.get("contenido", ""), int(match.group(1))))
+            return self.send_json({"ok":True})
+        except Exception as exc:
+            return self.send_json({"error":str(exc)},400)
+
+if __name__ == "__main__":
+    init_db()
+    init_presentations_db()
+    init_highlights_db()
+    init_reminders_db()
+    init_dashboard_db()
+    init_email_reminders_db()
+    init_automation_db()
+    start_email_reminder_worker()
+    start_automatic_mail_worker()
+    print(f"Mi Estudio Bíblico: http://127.0.0.1:{PORT}")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

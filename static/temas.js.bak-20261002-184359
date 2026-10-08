@@ -1,0 +1,153 @@
+/* ===========================================================
+   TEMAS_V1 — selector de temas con persistencia
+   Temas: verde, azul, violeta, ambar, monocromo, sepia, oscuro, contraste
+=========================================================== */
+const TEMAS = {
+  verde:    {nombre:'🌿 Verde Bosque',    icono:'🌿', desc:'Natural y tranquilo'},
+  azul:     {nombre:'🌊 Azul Océano',     icono:'🌊', desc:'Profundo y sereno'},
+  violeta:  {nombre:'🌅 Violeta Crepúsculo',icono:'🌅', desc:'Místico y cálido'},
+  ambar:    {nombre:'🍂 Ámbar Cálido',    icono:'🍂', desc:'Acogedor y nostálgico'},
+  monocromo:{nombre:'⚫ Monocromo Elegante',icono:'⚫', desc:'Limpio y técnico'},
+  sepia:    {nombre:'📜 Sepia Lectura',   icono:'📜', desc:'Como papel envejecido'},
+  oscuro:   {nombre:'🌙 Noche Oscura',    icono:'🌙', desc:'Para leer de noche'},
+  contraste:{nombre:'🌈 Alto Contraste',  icono:'🌈', desc:'Accesibilidad total'},
+};
+
+const TEMA_KEY = 'estudioBiblicoTemaActual';
+const TEMA_DEFECTO = 'verde';
+
+function getTemaActual(){
+  try{
+    const t = localStorage.getItem(TEMA_KEY);
+    return TEMAS[t] ? t : TEMA_DEFECTO;
+  }catch(e){ return TEMA_DEFECTO; }
+}
+
+function aplicarTema(temaId){
+  const tema = TEMAS[temaId] || TEMAS[TEMA_DEFECTO];
+  document.documentElement.setAttribute('data-tema', temaId);
+  try{ localStorage.setItem(TEMA_KEY, temaId); }catch(e){}
+  // actualizar selector si está abierto
+  const sel = document.getElementById('temaSelector');
+  if(sel) sel.value = temaId;
+  // notificar a componentes que escuchan
+  window.dispatchEvent(new CustomEvent('temaCambiado', {detail:{tema:temaId, datos:tema}}));
+  return tema;
+}
+
+function initTema(){
+  const t = getTemaActual();
+  aplicarTema(t);
+}
+
+// Crear selector de temas (modal)
+function abrirSelectorTema(){
+  if(document.getElementById('temaModal')) return;
+  const actual = getTemaActual();
+  const modal = document.createElement('div');
+  modal.id = 'temaModal';
+  modal.innerHTML = `
+    <div class="tema-modal-overlay" onclick="cerrarTemaModal(event)">
+      <div class="tema-modal" onclick="event.stopPropagation()">
+        <button class="tema-cerrar" onclick="cerrarTemaModal()" aria-label="Cerrar">✕</button>
+        <h2>🎨 Elige tu tema</h2>
+        <p class="tema-sub">Tu preferencia se guarda y sincroniza entre dispositivos</p>
+        <div class="tema-grid" id="temaGrid"></div>
+        <p class="tema-nota">Los cambios se aplican al instante. Tu tema actual se marca con ✓</p>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  const grid = modal.querySelector('#temaGrid');
+  Object.entries(TEMAS).forEach(([id, tema])=>{
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `tema-opcion ${id===getTemaActual()?'activa':''}`;
+    btn.dataset.tema = id;
+    btn.innerHTML = `<span class="tema-icono">${tema.icono}</span><div><strong>${tema.nombre}</strong><br><small>${tema.desc}</small></div>`;
+    btn.onclick = () => { aplicarTema(id); renderGrid(); };
+    grid.appendChild(btn);
+  });
+  // animación entrada: la clase "abierto" va en el overlay
+  const overlay = modal.querySelector('.tema-modal-overlay');
+  requestAnimationFrame(()=> overlay.classList.add('abierto'));
+}
+
+function renderGrid(){
+  const actual = getTemaActual();
+  document.querySelectorAll('#temaGrid .tema-opcion').forEach(b=>{
+    b.classList.toggle('activa', b.dataset.tema === actual);
+  });
+}
+
+function cerrarTemaModal(e){
+  const modal = document.getElementById('temaModal');
+  if(e && e.target !== e.currentTarget) return;
+  if(!modal) return;
+  const overlay = modal.querySelector('.tema-modal-overlay');
+  overlay.classList.remove('abierto');
+  setTimeout(()=> modal.remove(), 200);
+}
+
+// Botón flotante para abrir selector (se inyecta en ajustes o se usa standalone)
+function crearBotonTema(){
+  const btn = document.createElement('button');
+  btn.id = 'btnTemaFlotante';
+  btn.type = 'button';
+  btn.className = 'tema-boton-flotante';
+  btn.title = 'Cambiar tema';
+  btn.innerHTML = '🎨';
+  btn.onclick = abrirSelectorTema;
+  return btn;
+}
+
+// Inicialización automática
+if(typeof window !== 'undefined'){
+  initTema();
+  // Exponer globalmente
+  window.Temas = {TEMAS, aplicarTema, getTemaActual, abrirSelectorTema, cerrarTemaModal, crearBotonTema};
+}
+
+// Estilos del modal (inyectados dinámicamente)
+const estilosModal = `
+.tema-modal-overlay{
+  position:fixed;inset:0;background:#000a;z-index:1000;
+  display:grid;place-items:center;padding:16px;
+  opacity:0;transform:scale(.95);transition:opacity .2s,transform .2s;
+}
+.tema-modal-overlay.abierto{opacity:1;transform:scale(1)}
+.tema-modal{
+  background:var(--panel);border-radius:16px;padding:20px;
+  width:100%;max-width:420px;box-shadow:0 20px 60px #0004;
+  position:relative;
+}
+.tema-cerrar{
+  position:absolute;top:8px;right:10px;border:0;background:transparent;
+  font-size:22px;color:var(--muted);cursor:pointer;padding:4px;line-height:1;
+}
+.tema-cerrar:hover{color:var(--text)}
+.tema-modal h2{margin:0 0 4px;font-size:20px}
+.tema-sub{margin:0 0 16px;color:var(--muted);font-size:13px}
+.tema-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;max-height:50vh;overflow:auto}
+.tema-opcion{
+  border:2px solid var(--line);background:var(--panel);border-radius:12px;
+  padding:14px 12px;cursor:pointer;text-align:left;transition:.15s;
+}
+.tema-opcion:hover{border-color:var(--green);background:var(--green2)}
+.tema-opcion.activa{
+  border-color:var(--green);background:var(--green2);box-shadow:0 0 0 2px var(--green2)
+}
+.tema-icono{font-size:20px;display:block;margin-bottom:6px}
+.tema-opcion strong{display:block;font-size:14px}
+.tema-opcion small{color:var(--muted);font-size:12px}
+.tema-nota{margin:12px 0 0;font-size:12px;color:var(--muted);text-align:center}
+@media(max-width:520px){
+  .tema-grid{grid-template-columns:1fr}
+}
+`;
+
+// Inyectar estilos al cargar
+if(typeof document !== 'undefined'){
+  const style = document.createElement('style');
+  style.textContent = estilosModal;
+  document.head.appendChild(style);
+}

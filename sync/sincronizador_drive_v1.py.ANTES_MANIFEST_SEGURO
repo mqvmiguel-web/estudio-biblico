@@ -1,0 +1,372 @@
+from pathlib import Path
+import hashlib
+import json
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+BASE = Path.home() / "estudio-biblico"
+DATA = BASE / "data"
+SYNC = BASE / "sync"
+
+CONFIG = SYNC / "config.json"
+ULTIMA_SYNC = SYNC / "ultima_sync.json"
+
+REMOTE_BASE = "estudio-drive:Mi Estudio Biblico/Sync"
+REMOTE_DATA = REMOTE_BASE + "/data"
+REMOTE_MANIFEST = REMOTE_BASE + "/manifest.json"
+
+ARCHIVOS = [
+    "data/estudio.db",
+]
+
+DOCUMENTOS_DIR = DATA / "documentos"
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def archivos_sincronizables():
+    rutas = list(ARCHIVOS)
+
+    if DOCUMENTOS_DIR.exists():
+        for p in sorted(DOCUMENTOS_DIR.glob("*.json")):
+            rutas.append(str(p.relative_to(BASE)))
+
+    return rutas
+
+
+def crear_manifest():
+    archivos = []
+
+    for relativa in archivos_sincronizables():
+        path = BASE / relativa
+
+        if not path.exists():
+            continue
+
+        archivos.append({
+            "ruta": relativa,
+            "tamano": path.stat().st_size,
+            "sha256": sha256(path),
+        })
+
+    return {
+        "version": 1,
+        "creado": datetime.now().isoformat(timespec="seconds"),
+        "archivos": archivos,
+    }
+
+
+def mapa_manifest(manifest):
+    return {
+        x["ruta"]: x["sha256"]
+        for x in manifest.get("archivos", [])
+    }
+
+
+def cargar_json(path):
+    if not path.exists():
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def guardar_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def ejecutar(cmd):
+    return subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True
+    )
+
+
+def descargar_manifest_drive():
+    destino = SYNC / "manifest_drive_temporal.json"
+
+    if destino.exists():
+        destino.unlink()
+
+    r = ejecutar([
+        "rclone",
+        "copyto",
+        REMOTE_MANIFEST,
+        str(destino),
+    ])
+
+    if r.returncode != 0:
+        return None
+
+    try:
+        return cargar_json(destino)
+    finally:
+        destino.unlink(missing_ok=True)
+
+
+def cambios_desde(base, actual):
+    if base is None:
+        return True
+
+    return mapa_manifest(base) != mapa_manifest(actual)
+
+
+def respaldo_local():
+    fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+    destino = BASE / "respaldos" / f"SYNC_AUTO_{fecha}"
+
+    destino.mkdir(parents=True, exist_ok=True)
+
+    db = DATA / "estudio.db"
+
+    if db.exists():
+        origen = sqlite3.connect(str(db))
+        copia = sqlite3.connect(str(destino / "estudio.db"))
+
+        with copia:
+            origen.backup(copia)
+
+        copia.close()
+        origen.close()
+
+    if DOCUMENTOS_DIR.exists():
+        docs_destino = destino / "documentos"
+        docs_destino.mkdir(exist_ok=True)
+
+        for p in DOCUMENTOS_DIR.glob("*.json"):
+            shutil.copy2(p, docs_destino / p.name)
+
+    return destino
+
+
+def crear_snapshot_subida():
+    tempdir = Path(tempfile.mkdtemp(prefix="estudio_sync_"))
+
+    data_temp = tempdir / "data"
+    data_temp.mkdir(parents=True)
+
+    db = DATA / "estudio.db"
+
+    if db.exists():
+        origen = sqlite3.connect(str(db))
+        copia = sqlite3.connect(str(data_temp / "estudio.db"))
+
+        with copia:
+            origen.backup(copia)
+
+        copia.close()
+        origen.close()
+
+    if DOCUMENTOS_DIR.exists():
+        docs = data_temp / "documentos"
+        docs.mkdir(exist_ok=True)
+
+        for p in DOCUMENTOS_DIR.glob("*.json"):
+            shutil.copy2(p, docs / p.name)
+
+    return tempdir
+
+
+def subir():
+    print("☁️ Preparando snapshot seguro...")
+
+    snapshot = crear_snapshot_subida()
+
+    try:
+        r = subprocess.run([
+            "rclone",
+            "copy",
+            str(snapshot / "data"),
+            REMOTE_DATA,
+            "--filter", "+ /estudio.db",
+            "--filter", "+ /documentos/*.json",
+            "--filter", "- *",
+        ])
+
+        if r.returncode != 0:
+            print("❌ Error al subir los datos.")
+            return False
+
+        manifest = crear_manifest()
+
+        temp_manifest = snapshot / "manifest.json"
+        guardar_json(temp_manifest, manifest)
+
+        r = subprocess.run([
+            "rclone",
+            "copyto",
+            str(temp_manifest),
+            REMOTE_MANIFEST,
+        ])
+
+        if r.returncode != 0:
+            print("❌ Datos subidos, pero falló el manifest.")
+            return False
+
+        guardar_json(ULTIMA_SYNC, manifest)
+
+        print("✅ Sincronización subida correctamente.")
+        return True
+
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+
+
+def descargar():
+    print("⬇️ Preparando descarga segura...")
+
+    respaldo = respaldo_local()
+    print(f"🔐 Respaldo creado: {respaldo}")
+
+    tempdir = Path(tempfile.mkdtemp(prefix="estudio_descarga_"))
+
+    try:
+        r = subprocess.run([
+            "rclone",
+            "copy",
+            REMOTE_DATA,
+            str(tempdir / "data"),
+        ])
+
+        if r.returncode != 0:
+            print("❌ Error al descargar.")
+            return False
+
+        db_remota = tempdir / "data" / "estudio.db"
+
+        if db_remota.exists():
+            con = sqlite3.connect(str(db_remota))
+            resultado = con.execute("PRAGMA integrity_check;").fetchone()
+            con.close()
+
+            if not resultado or resultado[0] != "ok":
+                print("❌ La base descargada no pasó integrity_check.")
+                return False
+
+            shutil.copy2(db_remota, DATA / "estudio.db")
+
+        docs_remotos = tempdir / "data" / "documentos"
+
+        if docs_remotos.exists():
+            DOCUMENTOS_DIR.mkdir(parents=True, exist_ok=True)
+
+            for p in docs_remotos.glob("*.json"):
+                shutil.copy2(p, DOCUMENTOS_DIR / p.name)
+
+        manifest_drive = descargar_manifest_drive()
+
+        if manifest_drive:
+            guardar_json(ULTIMA_SYNC, manifest_drive)
+
+        print("✅ Datos descargados correctamente.")
+        return True
+
+    finally:
+        shutil.rmtree(tempdir, ignore_errors=True)
+
+
+def estado():
+    base = cargar_json(ULTIMA_SYNC)
+    local = crear_manifest()
+    drive = descargar_manifest_drive()
+
+    if drive is None:
+        print("❌ No se pudo leer el manifest de Google Drive.")
+        sys.exit(2)
+
+    local_cambio = cambios_desde(base, local)
+    drive_cambio = cambios_desde(base, drive)
+
+    print("===== ESTADO DE SINCRONIZACION =====")
+
+    if not local_cambio and not drive_cambio:
+        print("🟢 Sincronizado")
+        return "sincronizado"
+
+    if local_cambio and not drive_cambio:
+        print("🟡 Hay cambios locales pendientes de subir")
+        return "subir"
+
+    if not local_cambio and drive_cambio:
+        print("🔵 Hay cambios en Google Drive pendientes de descargar")
+        return "descargar"
+
+    print("⚠️ CONFLICTO")
+    print("Hay cambios tanto en este equipo como en Google Drive.")
+    print("No se sobrescribirá nada automáticamente.")
+    return "conflicto"
+
+
+def main():
+    modo = sys.argv[1] if len(sys.argv) > 1 else "estado"
+
+    if modo == "estado":
+        estado()
+
+    elif modo == "subir":
+        e = estado()
+
+        if e == "conflicto":
+            sys.exit(3)
+
+        if e == "descargar":
+            print("❌ Hay una versión más nueva en Drive. Descárgala primero.")
+            sys.exit(4)
+
+        subir()
+
+    elif modo == "descargar":
+        e = estado()
+
+        if e == "conflicto":
+            sys.exit(3)
+
+        if e == "subir":
+            print("❌ Hay cambios locales sin subir. No se descargará encima.")
+            sys.exit(4)
+
+        descargar()
+
+    elif modo == "sync":
+        e = estado()
+
+        if e == "sincronizado":
+            print("✅ No hay nada que hacer.")
+
+        elif e == "subir":
+            respaldo = respaldo_local()
+            print(f"🔐 Respaldo creado: {respaldo}")
+            subir()
+
+        elif e == "descargar":
+            descargar()
+
+        else:
+            sys.exit(3)
+
+    else:
+        print("Uso:")
+        print("  sincronizador_drive_v1.py estado")
+        print("  sincronizador_drive_v1.py subir")
+        print("  sincronizador_drive_v1.py descargar")
+        print("  sincronizador_drive_v1.py sync")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

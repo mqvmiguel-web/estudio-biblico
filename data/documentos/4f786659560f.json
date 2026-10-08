@@ -1,0 +1,133 @@
+{
+  "id": "4f786659560f",
+  "nombre": "ESTUDIO BÍBLICO APOCALIPSIS 7 del 1 al 3...pdf",
+  "archivo": "4f786659560f.pdf",
+  "texto": "4f786659560f.txt",
+  "tamano": 84483,
+  "estado": "analizado",
+  "creado": "2026-09-30T16:36:20",
+  "error_extraccion": "",
+  "analisis": {
+    "resumen": "v.1: Después de esto vi a cuatro ángeles en pie sobre los cuatro ángulos de la tierra, Juan ve cuatro ángeles, cada uno situado en una de las esquinas de la tierra. cuatro vientos del cielo se encuentra en Dn.7:2; 11:4; Zac.6:5 (véase Ez. El texto, sin embargo, dice los cuatro vientos de la tierra, no del cielo. La palabra siervos, que se encuentra en Ap.2:20; 19:2, 5; 22:3, 6 y en la",
+    "palabras_clave": [
+      {
+        "palabra": "sello",
+        "frecuencia": 17
+      },
+      {
+        "palabra": "cuatro",
+        "frecuencia": 17
+      },
+      {
+        "palabra": "tierra",
+        "frecuencia": 16
+      },
+      {
+        "palabra": "ángeles",
+        "frecuencia": 14
+      },
+      {
+        "palabra": "vientos",
+        "frecuencia": 13
+      },
+      {
+        "palabra": "siervos",
+        "frecuencia": 11
+      },
+      {
+        "palabra": "ángel",
+        "frecuencia": 9
+      },
+      {
+        "palabra": "sellado",
+        "frecuencia": 9
+      },
+      {
+        "palabra": "poder",
+        "frecuencia": 8
+      },
+      {
+        "palabra": "frente",
+        "frecuencia": 8
+      },
+      {
+        "palabra": "palabra",
+        "frecuencia": 7
+      },
+      {
+        "palabra": "encuentra",
+        "frecuencia": 7
+      }
+    ],
+    "referencias": [
+      "APOCALIPSIS 7:1",
+      "Mt. 24:29-30",
+      "Ap. 6:17",
+      "Sal. 104:4",
+      "Heb. 1:7",
+      "Is. 11:12",
+      "Ez. 7:2",
+      "Dn. 7:2",
+      "Ez. 37:9",
+      "Jn. 3:8",
+      "Ez. 43:2",
+      "Apocalipsis 10:3",
+      "Ez. 9:4",
+      "Ap. 14:1",
+      "Ap. 13:16",
+      "Ap. 2:20",
+      "Jn. 10:28",
+      "Ef. 1:13",
+      "Ro. 8:16",
+      "Ap. 2:10",
+      "Ap. 9:4",
+      "Ap. 3:10",
+      "Ap. 6:15-17",
+      "Dt. 5:26",
+      "Jos. 3:10",
+      "Sal. 42:2",
+      "Is. 37:4",
+      "Dn. 6:26",
+      "Os. 1:10",
+      "Mt. 16:16",
+      "Hch. 14:15",
+      "Ap. 6:6",
+      "Ap. 22:4"
+    ],
+    "preguntas": [
+      "¿Qué enseña el documento acerca de sello?",
+      "¿Qué enseña el documento acerca de cuatro?",
+      "¿Qué enseña el documento acerca de tierra?",
+      "¿Cómo apoyan las referencias bíblicas las ideas principales del material?"
+    ],
+    "bosquejo": [
+      {
+        "punto": 1,
+        "idea": "v.1: Después de esto vi a cuatro ángeles en pie sobre los cuatro ángulos de la tierra"
+      },
+      {
+        "punto": 2,
+        "idea": "Juan ve cuatro ángeles, cada uno situado en una de las esquinas de la tierra."
+      },
+      {
+        "punto": 3,
+        "idea": "cuatro vientos del cielo se encuentra en Dn.7:2; 11:4; Zac.6:5 (véase Ez."
+      }
+    ],
+    "caracteres": 10437,
+    "palabras": 949,
+    "refs_v": 2
+  },
+  "notas": "",
+  "fichas": [],
+  "bibliografia": {
+    "autor": "hermith santibañez godoi",
+    "fecha_publicacion": "Wed Sep 30 16:35:47 2026 -03",
+    "editorial": "LibreOffice 26.8.0.3 (X86_64)",
+    "paginas": 4,
+    "titulo": "ESTUDIO BÍBLICO APOCALIPSIS 7 del 1 al 3...pdf"
+  },
+  "tipo_documento": "pequeno",
+  "calidad_extraccion": "legible",
+  "analisis_general_omitido": false
+}

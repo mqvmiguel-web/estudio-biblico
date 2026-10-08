@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "remote": "estudio-drive:",
+  "carpeta_drive": "Mi Estudio Biblico/Sync",
+  "sincronizar_base": true,
+  "sincronizar_analisis_documentos": true,
+  "sincronizar_pdfs": false,
+  "sincronizar_textos_extraidos": false,
+  "excluir": [
+    "correo_gmail.json"
+  ]
+}

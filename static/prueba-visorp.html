@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>prueba visor</title>
+<body>
+<pre id="out">corriendo...</pre>
+<script src="/vendor/pdfjs/pdf.min.js"></script>
+<script>
+const ping = (q) => { try { fetch('/__ping?' + q).catch(() => {}); } catch (e) {} };
+ping('inicio');
+window.addEventListener('error', e => ping('error:' + encodeURIComponent(String(e.message).slice(0, 150))));
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.js';
+(async () => {
+  const res = {};
+  try {
+    const t0 = Date.now();
+    const doc = await pdfjsLib.getDocument({
+      url: '/api/documents/2d674f457e9a/pdf',
+      standardFontDataUrl: '/vendor/pdfjs/standard_fonts/',
+      useSystemFonts: true
+    }).promise;
+    res.paginas = doc.numPages;
+    res.msCarga = Date.now() - t0;
+    const noBlanco = async (n) => {
+      const t = Date.now();
+      const page = await doc.getPage(n);
+      const vp = page.getViewport({scale: 1});
+      const c = document.createElement('canvas');
+      c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+      await page.render({canvasContext: c.getContext('2d'), viewport: vp}).promise;
+      const img = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let osc = 0, tot = 0;
+      for (let i = 0; i < img.length; i += 4 * 97) { tot++; if (img[i] < 235 || img[i+1] < 235 || img[i+2] < 235) osc++; }
+      return {pag: n, frac: Number((osc / tot).toFixed(4)), ms: Date.now() - t, ancho: c.width};
+    };
+    res.p1 = await noBlanco(1);
+    res.p47 = await noBlanco(Math.min(47, doc.numPages));
+    res.p900 = await noBlanco(Math.min(900, doc.numPages));
+    const t = Date.now();
+    const page = await doc.getPage(Math.min(47, doc.numPages));
+    const tc = await page.getTextContent();
+    res.textoPagina47 = tc.items.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+    res.msTexto = Date.now() - t;
+    res.ok = true;
+  } catch (e) {
+    res.error = String((e && e.message) || e);
+  }
+  document.getElementById('out').textContent = 'RESULTADO:' + JSON.stringify(res);
+  ping('RESULTADO' + encodeURIComponent(JSON.stringify(res)));
+})();
+</script>

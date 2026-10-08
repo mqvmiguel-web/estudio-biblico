@@ -1,0 +1,106 @@
+{
+  "id": "86f566f5777a",
+  "nombre": "18. Despertamiento espiritual - David Jeremiah.pdf",
+  "archivo": "86f566f5777a.pdf",
+  "texto": "86f566f5777a.txt",
+  "tamano": 65667,
+  "estado": "analizado",
+  "creado": "2026-10-07T23:36:32",
+  "error_extraccion": "",
+  "analisis": {
+    "resumen": "Despertamiento espiritual en la tribulación - David Despertamiento espiritual en la tribulación - David Jeremiah · pág. Esto es lo que tenemos en el capítulo 7 de Apocalipsis. Despertamiento espiritual en la tribulación - David Jeremiah · pág. Despertamiento espiritual en la tribulación - David Jeremiah · pág.",
+    "palabras_clave": [
+      {
+        "palabra": "tribulación",
+        "frecuencia": 33
+      },
+      {
+        "palabra": "tierra",
+        "frecuencia": 29
+      },
+      {
+        "palabra": "sellados",
+        "frecuencia": 26
+      },
+      {
+        "palabra": "judíos",
+        "frecuencia": 25
+      },
+      {
+        "palabra": "sello",
+        "frecuencia": 25
+      },
+      {
+        "palabra": "está",
+        "frecuencia": 23
+      },
+      {
+        "palabra": "espíritu",
+        "frecuencia": 23
+      },
+      {
+        "palabra": "tribus",
+        "frecuencia": 23
+      },
+      {
+        "palabra": "juicio",
+        "frecuencia": 22
+      },
+      {
+        "palabra": "israel",
+        "frecuencia": 21
+      },
+      {
+        "palabra": "iglesia",
+        "frecuencia": 19
+      },
+      {
+        "palabra": "apocalipsis",
+        "frecuencia": 18
+      }
+    ],
+    "referencias": [
+      "Ezequiel 9:3",
+      "Juan 6:27",
+      "Efesios 4:30",
+      "Apocalipsis 7:4",
+      "Zacarías 13:8",
+      "Apocalipsis 9:4"
+    ],
+    "preguntas": [
+      "¿Qué enseña el documento acerca de tribulación?",
+      "¿Qué enseña el documento acerca de tierra?",
+      "¿Qué enseña el documento acerca de sellados?",
+      "¿Cómo apoyan las referencias bíblicas las ideas principales del material?"
+    ],
+    "bosquejo": [
+      {
+        "punto": 1,
+        "idea": "Despertamiento espiritual en la tribulación - David"
+      },
+      {
+        "punto": 2,
+        "idea": "Despertamiento espiritual en la tribulación - David Jeremiah · pág."
+      },
+      {
+        "punto": 3,
+        "idea": "Esto es lo que tenemos en el capítulo 7 de Apocalipsis."
+      }
+    ],
+    "caracteres": 34029,
+    "palabras": 3093,
+    "refs_v": 2
+  },
+  "notas": "",
+  "fichas": [],
+  "bibliografia": {
+    "fecha_publicacion": "Wed Oct  7 23:35:10 2026 -03",
+    "paginas": 11,
+    "titulo": "18. Despertamiento espiritual - David Jeremiah.pdf",
+    "autor": "",
+    "editorial": ""
+  },
+  "tipo_documento": "pequeno",
+  "calidad_extraccion": "legible",
+  "analisis_general_omitido": false
+}

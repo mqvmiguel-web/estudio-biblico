@@ -1,0 +1,19 @@
+Visor PDF propio de Mi Estudio Bíblico
+======================================
+
+Motor: PDF.js de Mozilla, versión 3.11.174 (licencia MIT).
+Archivos:
+  pdf.min.js          (320 KB)  - motor de lectura de PDF
+  pdf.worker.min.js   (1.09 MB) - hilo de trabajo del motor
+  standard_fonts/     (800 KB)  - fuentes estándar (Foxit/Liberation) con sus licencias
+                                  (LICENSE_FOXIT, LICENSE_LIBERATION)
+
+Origen: descargado una sola vez desde internet
+  https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
+  https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/
+
+A partir de esta carpeta el visor funciona 100% local y sin conexión.
+No borrar ni renombrar: la app los carga desde /vendor/pdfjs/...
+Para volver al comportamiento anterior (abrir el PDF en otra pestaña con el
+visor del navegador), basta con quitar los botones del visor en static/index.html
+(respaldo: index.html.bak-visor-pdf-20260929-*).

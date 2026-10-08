@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE="http://127.0.0.1:8765"
+DB="$HOME/estudio-biblico/data/estudio.db"
+PROFILE="$HOME/.local/share/mi-estudio-biblico/chromium-proyector-profile"
+# Segunda pantalla detectada hoy: DP-5 en 0,99 con 1366x768.
+# Si cambia la pantalla, este script recalcula desde kscreen-doctor cuando puede.
+GEOM="0,99,1366,768"
+if command -v kscreen-doctor >/dev/null 2>&1; then
+  parsed=$(kscreen-doctor -o 2>/dev/null | sed -r 's/\x1B\[[0-9;]*[mK]//g' | awk '
+    /Output:/ {out=$3; enabled=0; connected=0; geom=""}
+    /enabled/ {enabled=1}
+    /connected/ {connected=1}
+    /Geometry:/ {geom=$2}
+    connected && enabled && out != "eDP-1" && geom != "" {print geom; exit}
+  ' || true)
+  if [[ -n "${parsed:-}" ]]; then
+    # parsed: X,Y WIDTHxHEIGHT
+    pos=${parsed%% *}; size=${parsed##* }
+    GEOM="${pos},${size/x/,}"
+  fi
+fi
+IFS=',' read -r X Y W H <<< "$GEOM"
+systemctl --user start mi-estudio-biblico.service
+for intento in {1..30}; do
+  curl -fsS "$BASE/api/books" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+PID_PRESENTACION="4"
+if command -v sqlite3 >/dev/null 2>&1 && [[ -f "$DB" ]]; then
+  PID_PRESENTACION=$(sqlite3 "$DB" "select id from presentaciones order by actualizado desc,id desc limit 1;" 2>/dev/null || echo 4)
+fi
+URL="$BASE/?presentacion=${PID_PRESENTACION}&modo=slides&proyector=1"
+if command -v chromium >/dev/null 2>&1; then
+  exec chromium --ozone-platform=x11 --app="$URL" --class=mi-estudio-biblico-proyector --window-position="$X,$Y" --window-size="$W,$H" --start-fullscreen --user-data-dir="$PROFILE"
+elif command -v google-chrome-stable >/dev/null 2>&1; then
+  exec google-chrome-stable --ozone-platform=x11 --app="$URL" --class=mi-estudio-biblico-proyector --window-position="$X,$Y" --window-size="$W,$H" --start-fullscreen --user-data-dir="$HOME/.local/share/mi-estudio-biblico/chrome-proyector-profile"
+else
+  exec firefox --new-window "$URL"
+fi
