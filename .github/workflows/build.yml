@@ -10,6 +10,27 @@ permissions:
   contents: read
   id-token: write
 
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
       - name: Configure Gradle timeouts
         run: |
           cd android
@@ -66,61 +87,4 @@ permissions:
           PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.IOS_PROVISIONING_PROFILE }}
         run: |
           cd ios/App
-          xcodebuild -workspace App.xcworkspace \
-            -scheme App \
-            -configuration Release \
-            -archivePath App.xcarchive \
-            -destination "generic/platform=iOS" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM=${APPLE_DEVELOPER_TEAM_ID} \
-            PROVISIONING_PROFILE_SPECIFIER="${PROVISIONING_PROFILE_SPECIFIER}" \
-            archive
-
-      - name: Export IPA
-        env:
-          APPLE_DEVELOPER_TEAM_ID: ${{ secrets.APPLE_DEVELOPER_TEAM_ID }}
-          PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.IOS_PROVISIONING_PROFILE }}
-        run: |
-          cd ios/App
-          xcodebuild -exportArchive \
-            -archivePath App.xcarchive \
-            -exportPath . \
-            -exportOptionsPlist ExportOptions.plist \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM=${APPLE_DEVELOPER_TEAM_ID} \
-            PROVISIONING_PROFILE_SPECIFIER="${PROVISIONING_PROFILE_SPECIFIER}"
-
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: app.ipa
-          path: ios/App/*.ipa
-          retention-days: 30
-
-  release:
-    name: Create Release
-    needs: [android, ios]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download APK
-        uses: actions/download-artifact@v4
-        with:
-          name: app-release.apk
-          path: ./release
-
-      - name: Download IPA
-        uses: actions/download-artifact@v4
-        with:
-          name: app.ipa
-          path: ./release
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/app-release.apk
-            release/app.ipa
-          generate_release_notes: true
+          xcodebuild -workspace
