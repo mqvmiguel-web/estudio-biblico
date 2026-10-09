@@ -1,0 +1,6 @@
+{
+  "appId": "com.mqvmiguelweb.estudiobiblico",
+  "appName": "Mi Estudio Bíblico",
+  "webDir": "static",
+  "bundledWebRuntime": false
+}
