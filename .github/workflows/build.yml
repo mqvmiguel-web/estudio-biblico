@@ -11,13 +11,51 @@ permissions:
   id-token: write
 
 jobs:
-  android:
+    android:
     name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    defaults:
-      run:
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Configure Gradle timeouts
+        run: |
+          cd android
+          echo "org.gradle.internal.http.connectionTimeout=120000" >> gradle.properties
+          echo "org.gradle.internal.http.socketTimeout=120000" >> gradle.properties
+          echo "org.gradle.internal.http.connectionTimeout=120000" >> ~/.gradle/gradle.properties
+          echo "org.gradle.internal.http.socketTimeout=120000" >> ~/.gradle/gradle.properties
+
+      - name: Build Release APK
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+          cache-read-only: true
+          arguments: assembleRelease
         working-directory: android
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release.apk
+          path: android/app/build/outputs/apk/release/*.apk
+          retention-days: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
