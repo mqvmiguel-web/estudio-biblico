@@ -33,6 +33,7 @@ jobs:
 
       - name: Configure Gradle timeouts
         run: |
+          mkdir -p ~/.gradle
           cd android
           echo "org.gradle.internal.http.connectionTimeout=120000" >> gradle.properties
           echo "org.gradle.internal.http.socketTimeout=120000" >> gradle.properties
