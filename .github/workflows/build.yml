@@ -12,13 +12,12 @@ permissions:
 
 jobs:
   android:
-    name: Build Android APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: android
-    steps:
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+steps:
       - name: Checkout
         uses: actions/checkout@v4
 
