@@ -6,12 +6,10 @@ on:
     branches: [main]
 
 jobs:
-  android:
+      android:
+    name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,6 +20,7 @@ jobs:
       - run: npx cap add android
       - run: npx cap sync android
       - run: |
+          cd android
           echo "org.gradle.internal.http.connectionTimeout=120000" >> gradle.properties
           echo "org.gradle.internal.http.socketTimeout=120000" >> gradle.properties
           echo "org.gradle.internal.http.connectionTimeout=120000" >> ~/.gradle/gradle.properties
@@ -30,7 +29,8 @@ jobs:
         with:
           gradle-version: '8.5'
           arguments: assembleRelease
+        working-directory: android
       - uses: actions/upload-artifact@v4
         with:
           name: app-release.apk
-          path: app/build/outputs/apk/release/*.apk
+          path: android/app/build/outputs/apk/release/*.apk
